@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.ImageDecoder
 import android.graphics.Paint
 import android.graphics.RectF
 import android.net.Uri
@@ -32,8 +33,7 @@ object StickerConverter {
     var animatedEncoder: AnimatedEncoder = NotConfiguredEncoder
 
     fun convertStatic(context: Context, input: Uri, output: File) {
-        val src = context.contentResolver.openInputStream(input)?.use { BitmapFactory.decodeStream(it) }
-            ?: error("Could not read image")
+        val src = decode(context, input)
         val bmp = fitOnTransparentSquare(src, STICKER_SIZE)
         for (quality in 90 downTo 10 step 10) {
             val bytes = ByteArrayOutputStream().also { bmp.compress(webpFormat(), quality, it) }.toByteArray()
@@ -43,6 +43,22 @@ object StickerConverter {
                 return
             }
         }
+    }
+
+    /** ImageDecoder (Android 9+) handles more formats; BitmapFactory is the fallback. */
+    private fun decode(context: Context, uri: Uri): Bitmap {
+        if (Build.VERSION.SDK_INT >= 28) {
+            try {
+                val source = ImageDecoder.createSource(context.contentResolver, uri)
+                return ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                }
+            } catch (e: Exception) {
+                // fall through to BitmapFactory
+            }
+        }
+        val bmp = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+        return bmp ?: error("Could not read this file as an image (type: ${context.contentResolver.getType(uri)})")
     }
 
     fun convertAnimated(context: Context, input: Uri, output: File) =
