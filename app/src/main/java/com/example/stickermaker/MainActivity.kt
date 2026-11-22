@@ -1,9 +1,9 @@
 package com.example.stickermaker
 
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -21,6 +21,20 @@ import java.io.File
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
+
+    // Message shown on screen (progress, errors, and WhatsApp's answer).
+    private var status by mutableStateOf("")
+
+    private val addLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            val err = result.data?.getStringExtra("validation_error")
+            status = when {
+                result.resultCode == RESULT_OK -> "Done: the pack was added to WhatsApp."
+                err != null -> "WhatsApp rejected the pack: $err"
+                else -> "The pack was not added (cancelled, or WhatsApp refused it)."
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         StickerConverter.animatedEncoder = AnimatedWebpEncoder()
@@ -52,14 +66,18 @@ class MainActivity : ComponentActivity() {
                 enabled = !busy && name.isNotBlank() && picked.size in 3..30,
                 onClick = {
                     busy = true
+                    status = "Starting..."
                     scope.launch {
                         val result = withContext(Dispatchers.IO) { runCatching { buildPack(name.trim(), animated, picked) } }
                         busy = false
-                        result.onSuccess { addToWhatsApp(it) }
-                            .onFailure { Toast.makeText(this@MainActivity, it.message ?: "Error", Toast.LENGTH_LONG).show() }
+                        result
+                            .onSuccess { status = "Pack created. Opening WhatsApp..."; addToWhatsApp(it) }
+                            .onFailure { status = "Error: ${it.message ?: it.javaClass.simpleName}" }
                     }
                 },
             ) { Text(if (busy) "Working..." else "Create and add to WhatsApp") }
+
+            if (status.isNotBlank()) Text(status, style = MaterialTheme.typography.bodyLarge)
         }
     }
 
@@ -69,6 +87,7 @@ class MainActivity : ComponentActivity() {
         val dir = store.packDir(id).apply { mkdirs() }
         try {
             val stickers = uris.mapIndexed { i, uri ->
+                status = "Converting sticker ${i + 1} of ${uris.size}..."
                 val file = File(dir, "sticker_$i.webp")
                 if (animated) StickerConverter.convertAnimated(this, uri, file)
                 else StickerConverter.convertStatic(this, uri, file)
@@ -92,9 +111,11 @@ class MainActivity : ComponentActivity() {
             .putExtra("sticker_pack_authority", StickerContentProvider.authority(packageName))
             .putExtra("sticker_pack_name", pack.name)
         try {
-            startActivity(Intent.createChooser(intent, "Add to WhatsApp"))
+            addLauncher.launch(intent)
+        } catch (e: ActivityNotFoundException) {
+            status = "WhatsApp is not installed, or it does not support sticker packs."
         } catch (e: Exception) {
-            Toast.makeText(this, "WhatsApp is not installed", Toast.LENGTH_LONG).show()
+            status = "Could not open WhatsApp: ${e.message}"
         }
     }
 }
