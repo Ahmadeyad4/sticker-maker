@@ -1,1 +1,99 @@
+package com.example.stickermaker
+
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.UUID
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { MaterialTheme { Screen() } }
+    }
+
+    @Composable
+    private fun Screen() {
+        var name by remember { mutableStateOf("") }
+        var animated by remember { mutableStateOf(false) }
+        var picked by remember { mutableStateOf<List<Uri>>(emptyList()) }
+        var busy by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
+
+        val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { picked = it }
+
+        Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text("Sticker Maker", style = MaterialTheme.typography.headlineMedium)
+            OutlinedTextField(name, { name = it }, label = { Text("Pack name") }, modifier = Modifier.fillMaxWidth())
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(animated, { animated = it; picked = emptyList() })
+                Spacer(Modifier.width(12.dp))
+                Text(if (animated) "Animated pack (GIF / video)" else "Static pack (images)")
+            }
+            Button(onClick = { picker.launch(if (animated) "video/*" else "image/*") }) {
+                Text("Choose files (${picked.size}) - 3 to 30")
+            }
+            Button(
+                enabled = !busy && name.isNotBlank() && picked.size in 3..30,
+                onClick = {
+                    busy = true
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) { runCatching { buildPack(name.trim(), animated, picked) } }
+                        busy = false
+                        result.onSuccess { addToWhatsApp(it) }
+                            .onFailure { Toast.makeText(this@MainActivity, it.message ?: "Error", Toast.LENGTH_LONG).show() }
+                    }
+                },
+            ) { Text(if (busy) "Working..." else "Create and add to WhatsApp") }
+        }
+    }
+
+    private fun buildPack(name: String, animated: Boolean, uris: List<Uri>): StickerPack {
+        val store = StickerStore(this)
+        val id = UUID.randomUUID().toString()
+        val dir = store.packDir(id).apply { mkdirs() }
+        try {
+            val stickers = uris.mapIndexed { i, uri ->
+                val file = File(dir, "sticker_$i.webp")
+                if (animated) StickerConverter.convertAnimated(this, uri, file)
+                else StickerConverter.convertStatic(this, uri, file)
+                Sticker(file.name, "\uD83D\uDE00")
+            }
+            // Tray icon needs a still image; for animated packs supply your own frame (see README).
+            val trayFile = File(dir, "tray.png")
+            StickerConverter.makeTray(File(dir, stickers.first().file), trayFile)
+            return StickerPack(id, name, getString(applicationInfo.labelRes.takeIf { it != 0 } ?: android.R.string.untitled), animated, trayFile.name, stickers)
+                .also { store.save(it) }
+        } catch (e: Exception) {
+            dir.deleteRecursively()
+            throw e
+        }
+    }
+
+    private fun addToWhatsApp(pack: StickerPack) {
+        val intent = Intent("com.whatsapp.intent.action.ENABLE_STICKER_PACK")
+            .putExtra("sticker_pack_id", pack.id)
+            .putExtra("sticker_pack_authority", StickerContentProvider.authority(packageName))
+            .putExtra("sticker_pack_name", pack.name)
+        try {
+            startActivity(Intent.createChooser(intent, "Add to WhatsApp"))
+        } catch (e: Exception) {
+            Toast.makeText(this, "WhatsApp is not installed", Toast.LENGTH_LONG).show()
+        }
+    }
+}
 
