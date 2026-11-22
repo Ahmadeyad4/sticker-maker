@@ -23,6 +23,7 @@ import java.util.UUID
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        StickerConverter.animatedEncoder = AnimatedWebpEncoder()
         setContent { MaterialTheme { Screen() } }
     }
 
@@ -34,7 +35,7 @@ class MainActivity : ComponentActivity() {
         var busy by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
 
-        val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { picked = it }
+        val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { picked = it }
 
         Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Text("Sticker Maker", style = MaterialTheme.typography.headlineMedium)
@@ -44,7 +45,7 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.width(12.dp))
                 Text(if (animated) "Animated pack (GIF / video)" else "Static pack (images)")
             }
-            Button(onClick = { picker.launch(if (animated) "video/*" else "image/*") }) {
+            Button(onClick = { picker.launch(if (animated) arrayOf("video/*", "image/gif") else arrayOf("image/*")) }) {
                 Text("Choose files (${picked.size}) - 3 to 30")
             }
             Button(
@@ -73,10 +74,11 @@ class MainActivity : ComponentActivity() {
                 else StickerConverter.convertStatic(this, uri, file)
                 Sticker(file.name, "\uD83D\uDE00")
             }
-            // Tray icon needs a still image; for animated packs supply your own frame (see README).
+            // Tray icon needs a still image (animated packs use the first frame).
             val trayFile = File(dir, "tray.png")
-            StickerConverter.makeTray(File(dir, stickers.first().file), trayFile)
-            return StickerPack(id, name, getString(applicationInfo.labelRes.takeIf { it != 0 } ?: android.R.string.untitled), animated, trayFile.name, stickers)
+            val traySource = if (animated) File(dir, "sticker_0_still.png") else File(dir, stickers.first().file)
+            StickerConverter.makeTray(traySource, trayFile)
+            return StickerPack(id, name, "Sticker Maker", animated, trayFile.name, stickers)
                 .also { store.save(it) }
         } catch (e: Exception) {
             dir.deleteRecursively()
@@ -96,4 +98,3 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
-
