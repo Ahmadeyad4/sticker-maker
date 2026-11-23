@@ -34,6 +34,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.util.UUID
 import kotlin.math.max
 import kotlin.math.min
@@ -65,35 +66,47 @@ object TelegramApi {
         fields: Map<String, String> = emptyMap(),
         files: Map<String, File> = emptyMap(),
     ): JSONObject {
-        val boundary = "----stickermaker" + UUID.randomUUID().toString().replace("-", "")
         val conn = URL("https://api.telegram.org/bot$token/$method").openConnection() as HttpURLConnection
         try {
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.connectTimeout = 20_000
             conn.readTimeout = 180_000
-            conn.setChunkedStreamingMode(0)
-            conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-            conn.outputStream.use { out ->
-                fun text(s: String) = out.write(s.toByteArray(Charsets.UTF_8))
+
+            // Plain form for simple calls; multipart (built in memory, with a fixed length) only when sending files.
+            val payload: ByteArray
+            if (files.isEmpty()) {
+                payload = fields.entries.joinToString("&") {
+                    URLEncoder.encode(it.key, "UTF-8") + "=" + URLEncoder.encode(it.value, "UTF-8")
+                }.toByteArray(Charsets.UTF_8)
+                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+            } else {
+                val boundary = "----stickermaker" + UUID.randomUUID().toString().replace("-", "")
+                val buf = ByteArrayOutputStream()
+                fun text(s: String) = buf.write(s.toByteArray(Charsets.UTF_8))
                 for ((k, v) in fields) {
                     text("--$boundary\r\nContent-Disposition: form-data; name=\"$k\"\r\n\r\n$v\r\n")
                 }
                 for ((k, f) in files) {
                     text("--$boundary\r\nContent-Disposition: form-data; name=\"$k\"; filename=\"${f.name}\"\r\n" +
                         "Content-Type: application/octet-stream\r\n\r\n")
-                    f.inputStream().use { it.copyTo(out) }
+                    buf.write(f.readBytes())
                     text("\r\n")
                 }
                 text("--$boundary--\r\n")
+                payload = buf.toByteArray()
+                conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
             }
+            conn.setFixedLengthStreamingMode(payload.size)
+            conn.outputStream.use { it.write(payload) }
+
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            val answer = stream?.bufferedReader()?.use { it.readText() } ?: ""
             val json = try {
-                JSONObject(body)
+                JSONObject(answer)
             } catch (e: Exception) {
-                throw IllegalStateException("Unexpected answer from Telegram (HTTP $code)")
+                throw IllegalStateException("Unexpected answer from Telegram (HTTP $code): ${answer.take(150)}")
             }
             if (!json.optBoolean("ok")) {
                 throw IllegalStateException(json.optString("description", "Telegram error (HTTP $code)"))
