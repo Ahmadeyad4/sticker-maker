@@ -140,11 +140,12 @@ object TelegramPackBuilder {
         try {
             val files = ArrayList<File>()
             val skipped = ArrayList<String>()
+            var codecUsed = ""
             uris.forEachIndexed { i, uri ->
                 progress("Converting file ${i + 1} of ${uris.size}...")
                 val out = File(dir, "s${files.size}." + (if (animated) "webm" else "webp"))
                 try {
-                    if (animated) TelegramVideoEncoder.encode(context, uri, out)
+                    if (animated) codecUsed = TelegramVideoEncoder.encode(context, uri, out)
                     else TelegramStatic.convert(context, uri, out)
                     files.add(out)
                 } catch (e: Exception) {
@@ -170,16 +171,23 @@ object TelegramPackBuilder {
             }
 
             progress("Uploading ${files.size} sticker(s) to Telegram...")
-            TelegramApi.call(
-                token, "createNewStickerSet",
-                mapOf(
-                    "user_id" to userId.toString(),
-                    "name" to name,
-                    "title" to title.take(64),
-                    "stickers" to stickers.toString(),
-                ),
-                fileMap,
-            )
+            try {
+                TelegramApi.call(
+                    token, "createNewStickerSet",
+                    mapOf(
+                        "user_id" to userId.toString(),
+                        "name" to name,
+                        "title" to title.take(64),
+                        "stickers" to stickers.toString(),
+                    ),
+                    fileMap,
+                )
+            } catch (e: Exception) {
+                if (codecUsed == "VP8") {
+                    throw IllegalStateException("${e.message} (this phone can only encode VP8, and Telegram asks for VP9)")
+                }
+                throw e
+            }
             val note = if (skipped.isEmpty()) "" else "Skipped ${skipped.size}: ${skipped.joinToString("; ")}"
             return TelegramResult("https://t.me/addstickers/$name", note)
         } finally {
@@ -216,15 +224,51 @@ object TelegramStatic {
 object TelegramVideoEncoder {
     private val bitrates = intArrayOf(600_000, 450_000, 330_000, 240_000, 170_000, 110_000)
 
-    fun isSupported(): Boolean =
-        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { info ->
-            info.isEncoder && info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_VP9, ignoreCase = true) }
-        }
+    private const val CF_FLEX = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+    private const val CF_PLANAR = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
+    private const val CF_SEMI = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
 
-    fun encode(context: Context, input: Uri, output: File) {
-        if (!isSupported()) {
-            throw IllegalStateException("This phone has no VP9 video encoder, so animated Telegram stickers can't be made here")
+    private class Enc(val name: String, val mime: String, val colorFormat: Int)
+
+    private fun videoEncoders() =
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { it.isEncoder }
+
+    /** Prefers VP9 (what Telegram asks for), then VP8. Needs an encoder that accepts plain YUV frames. */
+    private fun findEncoder(): Enc? {
+        val encoders = videoEncoders()
+        for (mime in listOf(MediaFormat.MIMETYPE_VIDEO_VP9, MediaFormat.MIMETYPE_VIDEO_VP8)) {
+            for (info in encoders) {
+                if (info.supportedTypes.none { it.equals(mime, ignoreCase = true) }) continue
+                val colors = try {
+                    info.getCapabilitiesForType(mime).colorFormats
+                } catch (e: Exception) {
+                    continue
+                }
+                val cf = when {
+                    colors.contains(CF_FLEX) -> CF_FLEX
+                    colors.contains(CF_PLANAR) -> CF_PLANAR
+                    colors.contains(CF_SEMI) -> CF_SEMI
+                    else -> continue
+                }
+                return Enc(info.name, mime, cf)
+            }
         }
+        return null
+    }
+
+    private fun encoderReport(): String {
+        val types = videoEncoders().flatMap { it.supportedTypes.toList() }
+            .filter { it.startsWith("video/") }.distinct()
+        return if (types.isEmpty()) "none" else types.joinToString(", ")
+    }
+
+    fun isSupported(): Boolean = findEncoder() != null
+
+    /** Returns "VP9" or "VP8", whichever the phone could encode. */
+    fun encode(context: Context, input: Uri, output: File): String {
+        val enc = findEncoder() ?: throw IllegalStateException(
+            "This phone can't make WebM video (it needs a VP9 or VP8 encoder). Video encoders found: ${encoderReport()}",
+        )
         val frames = ArrayList<ByteArray>()
         val source = openSource(context, input)
         try {
@@ -246,16 +290,18 @@ object TelegramVideoEncoder {
 
         for (bitrate in bitrates) {
             output.delete()
-            encodeYuv(frames, bitrate, output)
-            if (output.length() in 1..TG_MAX_VIDEO_BYTES) return
+            encodeYuv(enc, frames, bitrate, output)
+            if (output.length() in 1..TG_MAX_VIDEO_BYTES) {
+                return if (enc.mime == MediaFormat.MIMETYPE_VIDEO_VP9) "VP9" else "VP8"
+            }
         }
         output.delete()
         error("Could not fit the animation under 256KB. Try a shorter or simpler clip.")
     }
 
-    private fun encodeYuv(frames: List<ByteArray>, bitrate: Int, out: File) {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_VP9, TG_SIZE, TG_SIZE).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+    private fun encodeYuv(enc: Enc, frames: List<ByteArray>, bitrate: Int, out: File) {
+        val format = MediaFormat.createVideoFormat(enc.mime, TG_SIZE, TG_SIZE).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, enc.colorFormat)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, TG_FPS)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
@@ -264,7 +310,7 @@ object TelegramVideoEncoder {
         var muxer: MediaMuxer? = null
         var muxerStarted = false
         try {
-            val c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_VP9)
+            val c = MediaCodec.createByCodecName(enc.name)
             codec = c
             c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             c.start()
@@ -287,7 +333,7 @@ object TelegramVideoEncoder {
                         val pts = nextFrame * 1_000_000L / TG_FPS
                         if (nextFrame < frames.size) {
                             val yuv = frames[nextFrame]
-                            fillInput(c, inIndex, yuv)
+                            fillInput(c, inIndex, yuv, enc.colorFormat)
                             c.queueInputBuffer(inIndex, 0, yuv.size, pts, 0)
                             nextFrame++
                         } else {
@@ -322,14 +368,36 @@ object TelegramVideoEncoder {
         }
     }
 
-    private fun fillInput(codec: MediaCodec, index: Int, yuv: ByteArray) {
-        val image = codec.getInputImage(index) ?: throw IllegalStateException("The encoder did not give an input buffer")
-        val planes = image.planes
+    /** Copies one planar I420 frame into the encoder's input buffer, in whatever layout it wants. */
+    private fun fillInput(codec: MediaCodec, index: Int, yuv: ByteArray, colorFormat: Int) {
         val w = TG_SIZE
         val h = TG_SIZE
-        copyPlane(planes[0], yuv, 0, w, h)
-        copyPlane(planes[1], yuv, w * h, w / 2, h / 2)
-        copyPlane(planes[2], yuv, w * h + w * h / 4, w / 2, h / 2)
+        if (colorFormat == CF_FLEX) {
+            val image = codec.getInputImage(index)
+            if (image != null) {
+                val planes = image.planes
+                copyPlane(planes[0], yuv, 0, w, h)
+                copyPlane(planes[1], yuv, w * h, w / 2, h / 2)
+                copyPlane(planes[2], yuv, w * h + w * h / 4, w / 2, h / 2)
+                return
+            }
+        }
+        val buf = codec.getInputBuffer(index) ?: throw IllegalStateException("The encoder did not give an input buffer")
+        buf.clear()
+        if (colorFormat == CF_SEMI) {
+            // NV12: all Y first, then U and V interleaved.
+            val ySize = w * h
+            val q = ySize / 4
+            buf.put(yuv, 0, ySize)
+            val uv = ByteArray(q * 2)
+            for (i in 0 until q) {
+                uv[2 * i] = yuv[ySize + i]
+                uv[2 * i + 1] = yuv[ySize + q + i]
+            }
+            buf.put(uv)
+        } else {
+            buf.put(yuv)
+        }
     }
 
     private fun copyPlane(plane: Image.Plane, src: ByteArray, offset: Int, w: Int, h: Int) {
