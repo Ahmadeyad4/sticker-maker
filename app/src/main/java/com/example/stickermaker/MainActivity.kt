@@ -9,6 +9,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -25,14 +27,18 @@ class MainActivity : ComponentActivity() {
     // Message shown on screen (progress, errors, and WhatsApp's answer).
     private var status by mutableStateOf("")
 
+    // What was created, shown together with WhatsApp's answer.
+    private var summary = ""
+
     private val addLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             val err = result.data?.getStringExtra("validation_error")
-            status = when {
+            val answer = when {
                 result.resultCode == RESULT_OK -> "Done: the pack was added to WhatsApp."
                 err != null -> "WhatsApp rejected the pack: $err"
                 else -> "The pack was not added (cancelled, or WhatsApp refused it)."
             }
+            status = "$summary\n\n$answer"
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -51,15 +57,18 @@ class MainActivity : ComponentActivity() {
 
         val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { picked = it }
 
-        Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
             Text("Sticker Maker", style = MaterialTheme.typography.headlineMedium)
             OutlinedTextField(name, { name = it }, label = { Text("Pack name") }, modifier = Modifier.fillMaxWidth())
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(animated, { animated = it; picked = emptyList() })
                 Spacer(Modifier.width(12.dp))
-                Text(if (animated) "Animated pack (GIF / video)" else "Static pack (images)")
+                Text(if (animated) "Animated pack (GIF / video / image)" else "Static pack (images)")
             }
-            Button(onClick = { picker.launch(if (animated) arrayOf("video/*", "image/gif") else arrayOf("image/*")) }) {
+            Button(onClick = { picker.launch(if (animated) arrayOf("video/*", "image/*") else arrayOf("image/*")) }) {
                 Text("Choose files (${picked.size}) - 3 to 30")
             }
             Button(
@@ -71,7 +80,7 @@ class MainActivity : ComponentActivity() {
                         val result = withContext(Dispatchers.IO) { runCatching { buildPack(name.trim(), animated, picked) } }
                         busy = false
                         result
-                            .onSuccess { status = "Pack created. Opening WhatsApp..."; addToWhatsApp(it) }
+                            .onSuccess { status = "$summary\n\nOpening WhatsApp..."; addToWhatsApp(it) }
                             .onFailure { status = "Error: ${it.message ?: it.javaClass.simpleName}" }
                     }
                 },
@@ -81,22 +90,47 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Converts every picked file to a WhatsApp-ready sticker (resizing, compressing, trimming).
+     * Files that cannot be converted are skipped, as long as 3 or more are left.
+     */
     private fun buildPack(name: String, animated: Boolean, uris: List<Uri>): StickerPack {
         val store = StickerStore(this)
         val id = UUID.randomUUID().toString()
         val dir = store.packDir(id).apply { mkdirs() }
         try {
-            val stickers = uris.mapIndexed { i, uri ->
-                status = "Converting sticker ${i + 1} of ${uris.size}..."
-                val file = File(dir, "sticker_$i.webp")
-                if (animated) StickerConverter.convertAnimated(this, uri, file)
-                else StickerConverter.convertStatic(this, uri, file)
-                Sticker(file.name, "\uD83D\uDE00")
+            val stickers = ArrayList<Sticker>()
+            val skipped = ArrayList<String>()
+            uris.forEachIndexed { i, uri ->
+                status = "Converting file ${i + 1} of ${uris.size}..."
+                val file = File(dir, "sticker_${stickers.size}.webp")
+                try {
+                    if (animated) StickerConverter.convertAnimated(this, uri, file)
+                    else StickerConverter.convertStatic(this, uri, file)
+                    StickerValidator.check(file, animated)?.let { error(it) }
+                    stickers.add(Sticker(file.name, "\uD83D\uDE00"))
+                } catch (e: Exception) {
+                    file.delete()
+                    skipped.add("file ${i + 1}: ${e.message ?: e.javaClass.simpleName}")
+                }
             }
+            if (stickers.size < 3) {
+                error("Only ${stickers.size} usable file(s), WhatsApp needs 3. " + skipped.joinToString("; "))
+            }
+
             // Tray icon needs a still image (animated packs use the first frame).
             val trayFile = File(dir, "tray.png")
             val traySource = if (animated) File(dir, "sticker_0_still.png") else File(dir, stickers.first().file)
             StickerConverter.makeTray(traySource, trayFile)
+
+            summary = buildString {
+                append("Created ${stickers.size} sticker(s)")
+                if (skipped.isNotEmpty()) append(", skipped ${skipped.size}: ${skipped.joinToString("; ")}")
+                append("\n")
+                append(stickers.take(5).joinToString("\n") {
+                    runCatching { StickerValidator.describe(File(dir, it.file)) }.getOrDefault(it.file)
+                })
+            }
             return StickerPack(id, name, "Sticker Maker", animated, trayFile.name, stickers)
                 .also { store.save(it) }
         } catch (e: Exception) {
