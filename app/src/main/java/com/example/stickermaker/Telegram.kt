@@ -14,6 +14,8 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
+import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.ReturnCode
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -183,7 +185,7 @@ object TelegramPackBuilder {
                     fileMap,
                 )
             } catch (e: Exception) {
-                if (codecUsed == "VP8") {
+                if (codecUsed == "VP8" && (e.message ?: "").contains("STICKER_VIDEO")) {
                     throw IllegalStateException("${e.message} (this phone can only encode VP8, and Telegram asks for VP9)")
                 }
                 throw e
@@ -218,7 +220,8 @@ object TelegramStatic {
 // =====================================================================
 //  Animated stickers (Telegram "video stickers"): WebM VP9, 512x512,
 //  up to 3 seconds, up to 256KB, 30 fps, no audio.
-//  Frames are encoded with the phone's own VP9 encoder (MediaCodec).
+//  Encoded with the bundled FFmpeg (libvpx VP9, keeps transparency);
+//  falls back to the phone's own encoder (MediaCodec) if FFmpeg cannot load.
 // =====================================================================
 
 object TelegramVideoEncoder {
@@ -264,36 +267,86 @@ object TelegramVideoEncoder {
 
     fun isSupported(): Boolean = findEncoder() != null
 
-    /** Returns "VP9" or "VP8", whichever the phone could encode. */
-    fun encode(context: Context, input: Uri, output: File): String {
-        val enc = findEncoder() ?: throw IllegalStateException(
-            "This phone can't make WebM video (it needs a VP9 or VP8 encoder). Video encoders found: ${encoderReport()}",
-        )
-        val frames = ArrayList<ByteArray>()
-        val source = openSource(context, input)
+    /** True when the bundled FFmpeg (with libvpx) loads on this phone. */
+    private val ffmpegOk: Boolean by lazy {
         try {
-            val durationMs = if (source.isStill) 1000L else min(max(source.durationMs, 1000L), TG_MAX_MS)
-            val count = max(2, (durationMs * TG_FPS / 1000).toInt())
-            for (i in 0 until count) {
-                if (source.isStill && frames.isNotEmpty()) {
-                    frames.add(frames[0])
-                    continue
-                }
-                val bmp = source.frameAt(i * 1000L / TG_FPS) ?: continue
-                frames.add(toI420(bmp))
-                bmp.recycle()
-            }
-        } finally {
-            source.close()
+            ReturnCode.isSuccess(FFmpegKit.execute("-version").returnCode)
+        } catch (t: Throwable) {
+            false
         }
-        if (frames.size < 2) error("Could not read enough frames from this file")
+    }
 
-        for (bitrate in bitrates) {
-            output.delete()
-            encodeYuv(enc, frames, bitrate, output)
-            if (output.length() in 1..TG_MAX_VIDEO_BYTES) {
-                return if (enc.mime == MediaFormat.MIMETYPE_VIDEO_VP9) "VP9" else "VP8"
+    private fun frameName(n: Int) = "f" + n.toString().padStart(3, '0') + ".png"
+
+    /**
+     * Makes a Telegram video sticker (WebM VP9, 512x512, up to 3s, under 256KB).
+     * Uses the bundled FFmpeg/libvpx when possible (keeps transparency), otherwise the phone's own encoder.
+     * Returns "VP9", or "VP8" when only a VP8 encoder was available.
+     */
+    fun encode(context: Context, input: Uri, output: File): String {
+        val useFfmpeg = ffmpegOk
+        val enc = if (useFfmpeg) null else (findEncoder() ?: throw IllegalStateException(
+            "This phone can't make WebM video (it needs a VP9 or VP8 encoder). Video encoders found: ${encoderReport()}",
+        ))
+        val workDir = File(context.cacheDir, "tgv_" + UUID.randomUUID()).apply { mkdirs() }
+        try {
+            val yuv = ArrayList<ByteArray>()
+            var count = 0
+            val source = openSource(context, input)
+            try {
+                val durationMs = if (source.isStill) 1000L else min(max(source.durationMs, 1000L), TG_MAX_MS)
+                val total = max(2, (durationMs * TG_FPS / 1000).toInt())
+                for (i in 0 until total) {
+                    if (source.isStill && count > 0) {
+                        if (useFfmpeg) File(workDir, frameName(0)).copyTo(File(workDir, frameName(count)))
+                        else yuv.add(yuv[0])
+                        count++
+                        continue
+                    }
+                    val bmp = source.frameAt(i * 1000L / TG_FPS) ?: continue
+                    if (useFfmpeg) {
+                        File(workDir, frameName(count)).outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                        bmp.recycle()
+                    } else {
+                        val flat = tgFlatten(bmp)
+                        yuv.add(toI420(flat))
+                        flat.recycle()
+                    }
+                    count++
+                }
+            } finally {
+                source.close()
             }
+            if (count < 2) error("Could not read enough frames from this file")
+
+            if (useFfmpeg) return encodeWithFfmpeg(workDir, output)
+
+            val e = enc ?: error("No video encoder available")
+            for (bitrate in bitrates) {
+                output.delete()
+                encodeYuv(e, yuv, bitrate, output)
+                if (output.length() in 1..TG_MAX_VIDEO_BYTES) {
+                    return if (e.mime == MediaFormat.MIMETYPE_VIDEO_VP9) "VP9" else "VP8"
+                }
+            }
+            output.delete()
+            error("Could not fit the animation under 256KB. Try a shorter or simpler clip.")
+        } finally {
+            workDir.deleteRecursively()
+        }
+    }
+
+    private fun encodeWithFfmpeg(dir: File, output: File): String {
+        val pattern = File(dir, "f%03d.png").path
+        for (kbps in intArrayOf(500, 380, 280, 200, 140, 90)) {
+            output.delete()
+            val command = "-y -framerate $TG_FPS -i $pattern -an -c:v libvpx-vp9 -pix_fmt yuva420p " +
+                "-auto-alt-ref 0 -b:v ${kbps}k -crf 34 -deadline good -cpu-used 4 -row-mt 1 ${output.path}"
+            val session = FFmpegKit.execute(command)
+            if (!ReturnCode.isSuccess(session.returnCode)) {
+                throw IllegalStateException("FFmpeg failed: " + (session.output ?: "").takeLast(300))
+            }
+            if (output.length() in 1..TG_MAX_VIDEO_BYTES) return "VP9"
         }
         output.delete()
         error("Could not fit the animation under 256KB. Try a shorter or simpler clip.")
@@ -491,7 +544,6 @@ object TelegramVideoEncoder {
             movie.setTime((ms % durationMs).toInt())
             val out = Bitmap.createBitmap(TG_SIZE, TG_SIZE, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(out)
-            canvas.drawColor(Color.BLACK)
             val s = min(TG_SIZE.toFloat() / movie.width(), TG_SIZE.toFloat() / movie.height())
             canvas.translate((TG_SIZE - movie.width() * s) / 2f, (TG_SIZE - movie.height() * s) / 2f)
             canvas.scale(s, s)
@@ -524,7 +576,7 @@ object TelegramVideoEncoder {
             val raw = retriever.getFrameAtTime(t * 1000, MediaMetadataRetriever.OPTION_CLOSEST) ?: return null
             val fitted = StickerConverter.fitOnTransparentSquare(raw, TG_SIZE)
             raw.recycle()
-            return tgFlatten(fitted)
+            return fitted
         }
 
         override fun close() {
@@ -537,7 +589,7 @@ object TelegramVideoEncoder {
         override val durationMs: Long = 1000L
         override val isStill: Boolean = true
 
-        override fun frameAt(ms: Long): Bitmap? = tgFlatten(StickerConverter.fitOnTransparentSquare(bitmap, TG_SIZE))
+        override fun frameAt(ms: Long): Bitmap? = StickerConverter.fitOnTransparentSquare(bitmap, TG_SIZE)
     }
 }
 
