@@ -4,11 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Movie
-import android.graphics.Paint
-import android.graphics.RectF
 import android.media.MediaMetadataRetriever
 import android.net.Uri
-import android.os.Build
 import java.io.ByteArrayOutputStream
 import java.io.File
 import kotlin.math.max
@@ -17,30 +14,31 @@ import kotlin.math.min
 private const val SIZE = 512
 private const val MAX_BYTES = 500 * 1024 - 2048
 private const val MAX_DURATION_MS = 9_500L
+private const val MIN_DURATION_MS = 1_000L
 
 /**
  * Animated WebP encoder with no native libraries.
- * Each frame is compressed as lossy WebP by Android, then the frames are
- * muxed into one animated WebP container (what WhatsApp expects).
- * Input: GIF or video (mp4, webm...).
+ * Accepts GIF, video, or even a plain image, and adjusts it to WhatsApp's rules:
+ * 512x512, under 500KB, under 10s, at least 2 frames.
  */
 class AnimatedWebpEncoder : AnimatedEncoder {
 
-    private data class Attempt(val fps: Int, val quality: Int)
+    private data class Attempt(val fps: Int, val quality: Int, val scale: Float)
 
     // Tried in order until the result fits under 500KB.
     private val attempts = listOf(
-        Attempt(15, 70), Attempt(12, 60), Attempt(10, 50),
-        Attempt(10, 35), Attempt(8, 30), Attempt(8, 20), Attempt(6, 15),
+        Attempt(15, 70, 1f), Attempt(12, 60, 1f), Attempt(10, 50, 1f), Attempt(10, 35, 1f),
+        Attempt(8, 30, 0.9f), Attempt(8, 20, 0.8f), Attempt(6, 15, 0.7f), Attempt(5, 10, 0.6f),
     )
 
     override fun encode(context: Context, input: Uri, output: File) {
         val source = openSource(context, input)
         try {
-            val durationMs = min(source.durationMs, MAX_DURATION_MS).coerceAtLeast(100L)
+            val durationMs = if (source.isStill) MIN_DURATION_MS
+            else min(max(source.durationMs, MIN_DURATION_MS), MAX_DURATION_MS)
 
             // Still image of the first frame (used for the pack's tray icon).
-            source.frameAt(0)?.let { first ->
+            source.frameAt(0, 1f)?.let { first ->
                 val still = File(output.parentFile, output.nameWithoutExtension + "_still.png")
                 still.outputStream().use { first.compress(Bitmap.CompressFormat.PNG, 100, it) }
             }
@@ -48,47 +46,70 @@ class AnimatedWebpEncoder : AnimatedEncoder {
             for (a in attempts) {
                 val webp = tryEncode(source, durationMs, a) ?: continue
                 output.writeBytes(webp)
+                StickerValidator.check(output, animated = true)?.let { error(it) }
                 return
             }
-            error("Could not fit the animation under 500KB. Try a shorter or simpler clip.")
+            error("Could not fit the animation under 500KB, even at low quality. Try a shorter clip.")
         } finally {
             source.close()
         }
     }
 
+    private fun compress(bmp: Bitmap, quality: Int): ByteArray =
+        ByteArrayOutputStream().also { bmp.compress(StickerConverter.webpFormat(), quality, it) }.toByteArray()
+
     private fun tryEncode(source: FrameSource, durationMs: Long, a: Attempt): ByteArray? {
+        if (source.isStill) {
+            // A plain image becomes a 2-frame animation (WhatsApp needs more than one frame).
+            val bmp = source.frameAt(0, a.scale) ?: return null
+            val bytes = compress(bmp, a.quality)
+            bmp.recycle()
+            val out = WebpMuxer.mux(listOf(bytes, bytes), SIZE, 500)
+            return if (out.size <= MAX_BYTES) out else null
+        }
+
         val frameMs = 1000 / a.fps
-        val count = max(1, (durationMs / frameMs).toInt())
+        val count = max(2, (durationMs / frameMs).toInt())
         val frames = ArrayList<ByteArray>(count)
         var total = 0
         for (i in 0 until count) {
-            val bmp = source.frameAt(i.toLong() * frameMs) ?: continue
-            val bytes = ByteArrayOutputStream().also { bmp.compress(webpFormat(), a.quality, it) }.toByteArray()
+            val bmp = source.frameAt(i.toLong() * frameMs, a.scale) ?: continue
+            val bytes = compress(bmp, a.quality)
             bmp.recycle()
             total += bytes.size
             if (total > MAX_BYTES) return null
             frames.add(bytes)
         }
-        if (frames.isEmpty()) return null
+        if (frames.size < 2) return null
         val out = WebpMuxer.mux(frames, SIZE, frameMs)
         return if (out.size <= MAX_BYTES) out else null
     }
-
-    @Suppress("DEPRECATION")
-    private fun webpFormat() =
-        if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
 
     // ---------- Frame sources ----------
 
     private interface FrameSource {
         val durationMs: Long
-        fun frameAt(ms: Long): Bitmap?
-        fun close()
+        val isStill: Boolean get() = false
+        fun frameAt(ms: Long, scale: Float): Bitmap?
+        fun close() {}
     }
 
     private fun openSource(context: Context, uri: Uri): FrameSource {
         val type = context.contentResolver.getType(uri) ?: ""
-        return if (type == "image/gif") GifSource(context, uri) else VideoSource(context, uri)
+        return when {
+            type == "image/gif" -> try {
+                GifSource(context, uri)
+            } catch (e: Exception) {
+                StillSource(context, uri)   // not really animated: treat as a normal image
+            }
+            type.startsWith("video/") -> VideoSource(context, uri)
+            type.startsWith("image/") -> StillSource(context, uri)
+            else -> try {
+                VideoSource(context, uri)
+            } catch (e: Exception) {
+                StillSource(context, uri)
+            }
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -99,40 +120,46 @@ class AnimatedWebpEncoder : AnimatedEncoder {
             val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                 ?: error("Could not read GIF")
             movie = Movie.decodeByteArray(bytes, 0, bytes.size) ?: error("Invalid GIF")
-            if (movie.width() <= 0 || movie.height() <= 0) error("Invalid GIF")
+            if (movie.width() <= 0 || movie.height() <= 0 || movie.duration() <= 0) error("GIF is not animated")
         }
 
-        override val durationMs: Long = movie.duration().toLong().let { if (it <= 0) 100L else it }
+        override val durationMs: Long = movie.duration().toLong()
 
-        override fun frameAt(ms: Long): Bitmap? {
+        override fun frameAt(ms: Long, scale: Float): Bitmap? {
             movie.setTime((ms % durationMs).toInt())
             val out = Bitmap.createBitmap(SIZE, SIZE, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(out)
-            val scale = min(SIZE.toFloat() / movie.width(), SIZE.toFloat() / movie.height())
-            canvas.translate((SIZE - movie.width() * scale) / 2f, (SIZE - movie.height() * scale) / 2f)
-            canvas.scale(scale, scale)
+            val s = min(SIZE.toFloat() / movie.width(), SIZE.toFloat() / movie.height()) * scale
+            canvas.translate((SIZE - movie.width() * s) / 2f, (SIZE - movie.height() * s) / 2f)
+            canvas.scale(s, s)
             movie.draw(canvas, 0f, 0f)
             return out
         }
-
-        override fun close() {}
     }
 
     private class VideoSource(context: Context, uri: Uri) : FrameSource {
-        private val retriever = MediaMetadataRetriever().apply { setDataSource(context, uri) }
+        private val retriever = MediaMetadataRetriever()
+        override val durationMs: Long
 
-        override val durationMs: Long =
-            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        init {
+            try {
+                retriever.setDataSource(context, uri)
+            } catch (e: Exception) {
+                retriever.release()
+                throw IllegalStateException("Could not read this file as a video")
+            }
+            val d = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+            if (d == null) {
+                retriever.release()
+                error("Could not read this file as a video")
+            }
+            durationMs = max(d, 1L)
+        }
 
-        override fun frameAt(ms: Long): Bitmap? {
-            val raw = retriever.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST) ?: return null
-            val out = Bitmap.createBitmap(SIZE, SIZE, Bitmap.Config.ARGB_8888)
-            val scale = min(SIZE.toFloat() / raw.width, SIZE.toFloat() / raw.height)
-            val w = raw.width * scale
-            val h = raw.height * scale
-            val left = (SIZE - w) / 2f
-            val top = (SIZE - h) / 2f
-            Canvas(out).drawBitmap(raw, null, RectF(left, top, left + w, top + h), Paint(Paint.FILTER_BITMAP_FLAG))
+        override fun frameAt(ms: Long, scale: Float): Bitmap? {
+            val t = ms % durationMs   // short clips loop
+            val raw = retriever.getFrameAtTime(t * 1000, MediaMetadataRetriever.OPTION_CLOSEST) ?: return null
+            val out = StickerConverter.fitOnTransparentSquare(raw, SIZE, scale)
             raw.recycle()
             return out
         }
@@ -140,6 +167,15 @@ class AnimatedWebpEncoder : AnimatedEncoder {
         override fun close() {
             retriever.release()
         }
+    }
+
+    private class StillSource(context: Context, uri: Uri) : FrameSource {
+        private val bitmap: Bitmap = StickerConverter.decode(context, uri)
+        override val durationMs: Long = MIN_DURATION_MS
+        override val isStill: Boolean = true
+
+        override fun frameAt(ms: Long, scale: Float): Bitmap? =
+            StickerConverter.fitOnTransparentSquare(bitmap, SIZE, scale)
     }
 }
 
