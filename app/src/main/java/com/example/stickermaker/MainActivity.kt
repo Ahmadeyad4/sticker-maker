@@ -75,6 +75,7 @@ class MainActivity : ComponentActivity() {
                 Text("Telegram stickers", style = MaterialTheme.typography.titleLarge)
             }
             Text("Both support static and animated stickers.")
+            UpdateBanner()
         }
     }
 
