@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -49,6 +50,36 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun Screen() {
+        var mode by remember { mutableStateOf("home") }
+        BackHandler(enabled = mode != "home") { mode = "home" }
+        when (mode) {
+            "whatsapp" -> WhatsAppScreen { mode = "home" }
+            "telegram" -> TelegramScreen { mode = "home" }
+            else -> HomeScreen { mode = it }
+        }
+    }
+
+    @Composable
+    private fun HomeScreen(onPick: (String) -> Unit) {
+        Column(
+            Modifier.fillMaxSize().padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp, Alignment.CenterVertically),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text("Sticker Maker", style = MaterialTheme.typography.headlineLarge)
+            Text("What do you want to make?")
+            Button(onClick = { onPick("whatsapp") }, modifier = Modifier.fillMaxWidth().height(88.dp)) {
+                Text("WhatsApp stickers", style = MaterialTheme.typography.titleLarge)
+            }
+            Button(onClick = { onPick("telegram") }, modifier = Modifier.fillMaxWidth().height(88.dp)) {
+                Text("Telegram stickers", style = MaterialTheme.typography.titleLarge)
+            }
+            Text("Both support static and animated stickers.")
+        }
+    }
+
+    @Composable
+    private fun WhatsAppScreen(onBack: () -> Unit) {
         var name by remember { mutableStateOf("") }
         var animated by remember { mutableStateOf(false) }
         var picked by remember { mutableStateOf<List<Uri>>(emptyList()) }
@@ -61,7 +92,8 @@ class MainActivity : ComponentActivity() {
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text("Sticker Maker", style = MaterialTheme.typography.headlineMedium)
+            TextButton(onClick = onBack) { Text("\u2190 Back") }
+            Text("WhatsApp stickers", style = MaterialTheme.typography.headlineMedium)
             OutlinedTextField(name, { name = it }, label = { Text("Pack name") }, modifier = Modifier.fillMaxWidth())
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(animated, { animated = it; picked = emptyList() })
