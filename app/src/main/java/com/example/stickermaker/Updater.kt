@@ -127,7 +127,7 @@ object Updater {
                 context.startActivity(
                     Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}")),
                 )
-                return "Allow \"Install unknown apps\" for Sticker Maker, then come back and tap Install again."
+                return Lang.t("upd_allow")
             }
             val uri = FileProvider.getUriForFile(context, "${context.packageName}.updates", apk)
             val intent = Intent(Intent.ACTION_VIEW)
@@ -136,7 +136,7 @@ object Updater {
             context.startActivity(intent)
             return null
         } catch (e: Exception) {
-            return "Could not open the installer: ${e.message}"
+            return Lang.t("upd_open_fail", e.message)
         }
     }
 }
@@ -154,13 +154,13 @@ fun UpdateBanner() {
     val check: (Boolean) -> Unit = { manual ->
         if (!checking) {
             checking = true
-            if (manual) message = "Checking for updates..."
+            if (manual) message = Lang.t("upd_checking")
             scope.launch {
                 val r = withContext(Dispatchers.IO) {
                     runCatching {
                         val u = Updater.checkForUpdate(context)
                         if (u == null) null
-                        else Pair(u, Updater.download(context, u) { p -> message = "Downloading update... $p%" })
+                        else Pair(u, Updater.download(context, u) { p -> message = Lang.t("upd_downloading", p) })
                     }
                 }
                 checking = false
@@ -168,14 +168,14 @@ fun UpdateBanner() {
                     if (pair == null) {
                         update = null
                         apk = null
-                        message = if (manual) "You have the latest version." else ""
+                        message = if (manual) Lang.t("upd_latest") else ""
                     } else {
                         update = pair.first
                         apk = pair.second
                         message = ""
                     }
                 }.onFailure {
-                    message = if (manual) "Update check failed: ${it.message ?: it.javaClass.simpleName}" else ""
+                    message = if (manual) Lang.t("upd_failed", it.message ?: it.javaClass.simpleName) else ""
                 }
             }
         }
@@ -187,15 +187,15 @@ fun UpdateBanner() {
         val u = update
         val f = apk
         if (u != null && f != null) {
-            Text("A new version is ready (${u.name})", style = MaterialTheme.typography.titleMedium)
+            Text(Lang.t("upd_ready", u.name), style = MaterialTheme.typography.titleMedium)
             Button(onClick = {
                 val m = Updater.install(context, f)
                 if (m != null) message = m
-            }) { Text("Install update") }
+            }) { Text(Lang.t("upd_install")) }
         }
         if (message.isNotBlank()) Text(message)
         TextButton(onClick = { check(true) }, enabled = !checking) {
-            Text("Check for updates (version ${Updater.currentName(context)})")
+            Text(Lang.t("upd_check", Updater.currentName(context)))
         }
     }
 }
