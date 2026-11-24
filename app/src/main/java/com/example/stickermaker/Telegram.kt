@@ -65,7 +65,7 @@ class TelegramNetworkException(message: String) : Exception(message)
 
 private fun tgErrorText(e: Throwable): String =
     if (e is TelegramNetworkException) Lang.t("tg_blocked")
-    else Lang.t("error") + ": " + (e.message ?: e.javaClass.simpleName)
+    else Lang.t("error_with", e.message ?: e.javaClass.simpleName)
 
 object TelegramApi {
     /** Calls a Bot API method and returns the JSON answer. Throws with Telegram's own message on errors. */
@@ -161,7 +161,7 @@ object TelegramPackBuilder {
                     files.add(out)
                 } catch (e: Exception) {
                     out.delete()
-                    skipped.add(Lang.t("file_n", i + 1) + ": " + (e.message ?: e.javaClass.simpleName))
+                    skipped.add(Lang.t("file_err", i + 1, e.message ?: e.javaClass.simpleName))
                 }
             }
             if (files.isEmpty()) error(Lang.t("tg_no_files", skipped.joinToString("; ")))
