@@ -8,6 +8,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.RandomAccessFile
 import kotlin.math.max
 import kotlin.math.min
 
@@ -32,7 +33,15 @@ class AnimatedWebpEncoder : AnimatedEncoder {
     )
 
     override fun encode(context: Context, input: Uri, output: File) {
-        val source = openSource(context, input)
+        encodeSource(openSource(context, input), output)
+    }
+
+    /** Encodes frames that were already decoded to a raw RGBA file (512x512 pixels, [fps] frames per second). */
+    fun encodeRaw(rawFile: File, fps: Int, output: File) {
+        encodeSource(RawSource(rawFile, fps), output)
+    }
+
+    private fun encodeSource(source: FrameSource, output: File) {
         try {
             val durationMs = if (source.isStill) MIN_DURATION_MS
             else min(max(source.durationMs, MIN_DURATION_MS), MAX_DURATION_MS)
@@ -176,6 +185,46 @@ class AnimatedWebpEncoder : AnimatedEncoder {
 
         override fun frameAt(ms: Long, scale: Float): Bitmap? =
             StickerConverter.fitOnTransparentSquare(bitmap, SIZE, scale)
+    }
+
+    /** Frames stored back to back as raw RGBA (with transparency) in one file. */
+    private class RawSource(file: File, private val fps: Int) : FrameSource {
+        private val frameBytes = SIZE * SIZE * 4
+        private val count = (file.length() / frameBytes).toInt()
+
+        init {
+            if (count < 2) error("Not enough frames")
+        }
+
+        private val access = RandomAccessFile(file, "r")
+        override val durationMs: Long = count * 1000L / fps
+
+        override fun frameAt(ms: Long, scale: Float): Bitmap? {
+            val index = ((ms * fps / 1000) % count).toInt()
+            val bytes = ByteArray(frameBytes)
+            access.seek(index.toLong() * frameBytes)
+            access.readFully(bytes)
+            val px = IntArray(SIZE * SIZE)
+            var o = 0
+            for (i in px.indices) {
+                val r = bytes[o].toInt() and 0xFF
+                val g = bytes[o + 1].toInt() and 0xFF
+                val b = bytes[o + 2].toInt() and 0xFF
+                val a = bytes[o + 3].toInt() and 0xFF
+                px[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                o += 4
+            }
+            val frame = Bitmap.createBitmap(SIZE, SIZE, Bitmap.Config.ARGB_8888)
+            frame.setPixels(px, 0, SIZE, 0, 0, SIZE, SIZE)
+            if (scale >= 0.999f) return frame
+            val scaled = StickerConverter.fitOnTransparentSquare(frame, SIZE, scale)
+            frame.recycle()
+            return scaled
+        }
+
+        override fun close() {
+            access.close()
+        }
     }
 }
 
