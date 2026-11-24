@@ -276,20 +276,68 @@ object TelegramVideoEncoder {
         }
     }
 
-    private fun frameName(n: Int) = "f" + n.toString().padStart(3, '0') + ".png"
+    private var rawProbe: Boolean? = null
+
+    /** The free FFmpeg build has no PNG decoder, so test whether it can read raw RGBA frames instead. */
+    private fun rawInputWorks(context: Context): Boolean {
+        rawProbe?.let { return it }
+        val result = ffmpegOk && (try {
+            val dir = File(context.cacheDir, "tgprobe").apply { mkdirs() }
+            val raw = File(dir, "probe.rgba")
+            val out = File(dir, "probe.webm")
+            raw.writeBytes(ByteArray(64 * 64 * 4 * 2))
+            out.delete()
+            val session = FFmpegKit.execute(
+                "-y -f rawvideo -pixel_format rgba -video_size 64x64 -framerate 30 -i ${raw.path} " +
+                    "-c:v libvpx-vp9 -pix_fmt yuva420p -auto-alt-ref 0 -b:v 100k ${out.path}",
+            )
+            val ok = ReturnCode.isSuccess(session.returnCode) && out.length() > 0
+            dir.deleteRecursively()
+            ok
+        } catch (t: Throwable) {
+            false
+        })
+        rawProbe = result
+        return result
+    }
+
+    private fun writeRawFrame(bmp: Bitmap, out: java.io.OutputStream) {
+        val w = bmp.width
+        val h = bmp.height
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+        val bytes = ByteArray(w * h * 4)
+        var o = 0
+        for (c in px) {
+            bytes[o++] = (c shr 16).toByte()
+            bytes[o++] = (c shr 8).toByte()
+            bytes[o++] = c.toByte()
+            bytes[o++] = (c ushr 24).toByte()
+        }
+        out.write(bytes)
+    }
 
     /**
      * Makes a Telegram video sticker (WebM VP9, 512x512, up to 3s, under 256KB).
-     * Uses the bundled FFmpeg/libvpx when possible (keeps transparency), otherwise the phone's own encoder.
-     * Returns "VP9", or "VP8" when only a VP8 encoder was available.
+     * 1) Best: frames go to the bundled FFmpeg/libvpx as raw RGBA (keeps transparency).
+     * 2) Else: the phone's own encoder makes a temporary video and FFmpeg turns it into VP9.
+     * 3) Else: the phone's own encoder only (VP9 if it has one, otherwise VP8 which Telegram rejects).
+     * Returns "VP9", or "VP8" in the last case.
      */
     fun encode(context: Context, input: Uri, output: File): String {
-        val useFfmpeg = ffmpegOk
-        val enc = if (useFfmpeg) null else (findEncoder() ?: throw IllegalStateException(
-            "This phone can't make WebM video (it needs a VP9 or VP8 encoder). Video encoders found: ${encoderReport()}",
-        ))
+        val ffOk = ffmpegOk
+        val rawMode = ffOk && rawInputWorks(context)
+        val enc = if (rawMode) null else findEncoder()
+        if (!rawMode && enc == null) {
+            throw IllegalStateException(
+                "This phone can't make WebM video. FFmpeg loaded: $ffOk. Video encoders found: ${encoderReport()}",
+            )
+        }
+
         val workDir = File(context.cacheDir, "tgv_" + UUID.randomUUID()).apply { mkdirs() }
         try {
+            val rawFile = File(workDir, "frames.rgba")
+            val rawOut = if (rawMode) rawFile.outputStream().buffered() else null
             val yuv = ArrayList<ByteArray>()
             var count = 0
             val source = openSource(context, input)
@@ -297,15 +345,14 @@ object TelegramVideoEncoder {
                 val durationMs = if (source.isStill) 1000L else min(max(source.durationMs, 1000L), TG_MAX_MS)
                 val total = max(2, (durationMs * TG_FPS / 1000).toInt())
                 for (i in 0 until total) {
-                    if (source.isStill && count > 0) {
-                        if (useFfmpeg) File(workDir, frameName(0)).copyTo(File(workDir, frameName(count)))
-                        else yuv.add(yuv[0])
+                    if (!rawMode && source.isStill && yuv.isNotEmpty()) {
+                        yuv.add(yuv[0])
                         count++
                         continue
                     }
                     val bmp = source.frameAt(i * 1000L / TG_FPS) ?: continue
-                    if (useFfmpeg) {
-                        File(workDir, frameName(count)).outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    if (rawOut != null) {
+                        writeRawFrame(bmp, rawOut)
                         bmp.recycle()
                     } else {
                         val flat = tgFlatten(bmp)
@@ -316,12 +363,26 @@ object TelegramVideoEncoder {
                 }
             } finally {
                 source.close()
+                rawOut?.close()
             }
             if (count < 2) error("Could not read enough frames from this file")
 
-            if (useFfmpeg) return encodeWithFfmpeg(workDir, output)
+            if (rawMode) {
+                return encodeWithFfmpeg(
+                    "-f rawvideo -pixel_format rgba -video_size ${TG_SIZE}x$TG_SIZE -framerate $TG_FPS -i ${rawFile.path}",
+                    "yuva420p", output,
+                )
+            }
 
             val e = enc ?: error("No video encoder available")
+            if (e.mime != MediaFormat.MIMETYPE_VIDEO_VP9 && ffOk) {
+                // The phone can only make VP8: use it for a temporary video, then let FFmpeg re-encode to VP9.
+                val mid = File(workDir, "mid.webm")
+                encodeYuv(e, yuv, 3_000_000, mid)
+                if (mid.length() == 0L) error("The phone's encoder produced no video")
+                return encodeWithFfmpeg("-i ${mid.path}", "yuv420p", output)
+            }
+
             for (bitrate in bitrates) {
                 output.delete()
                 encodeYuv(e, yuv, bitrate, output)
@@ -336,12 +397,11 @@ object TelegramVideoEncoder {
         }
     }
 
-    private fun encodeWithFfmpeg(dir: File, output: File): String {
-        val pattern = File(dir, "f%03d.png").path
+    private fun encodeWithFfmpeg(inputArgs: String, pixFmt: String, output: File): String {
         for (kbps in intArrayOf(500, 380, 280, 200, 140, 90)) {
             output.delete()
-            val command = "-y -framerate $TG_FPS -i $pattern -an -c:v libvpx-vp9 -pix_fmt yuva420p " +
-                "-auto-alt-ref 0 -b:v ${kbps}k -crf 34 -deadline good -cpu-used 4 -row-mt 1 ${output.path}"
+            val command = "-y $inputArgs -an -c:v libvpx-vp9 -pix_fmt $pixFmt -auto-alt-ref 0 " +
+                "-b:v ${kbps}k -crf 34 -deadline good -cpu-used 4 -row-mt 1 ${output.path}"
             val session = FFmpegKit.execute(command)
             if (!ReturnCode.isSuccess(session.returnCode)) {
                 throw IllegalStateException("FFmpeg failed: " + (session.output ?: "").takeLast(300))
