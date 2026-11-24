@@ -35,6 +35,11 @@ class MainActivity : ComponentActivity() {
     // What was created, shown together with WhatsApp's answer.
     private var summary = ""
 
+    // Packs waiting to be added to WhatsApp (a big Telegram pack becomes several WhatsApp packs).
+    private val queue = ArrayDeque<StickerPack>()
+    private var totalPacks = 0
+    private var pending by mutableStateOf(0)
+
     private val addLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             val err = result.data?.getStringExtra("validation_error")
@@ -44,6 +49,7 @@ class MainActivity : ComponentActivity() {
                 else -> Lang.t("wa_not_added")
             }
             status = "$summary\n\n$answer"
+            if (result.resultCode == RESULT_OK && queue.isNotEmpty()) launchNext() else pending = queue.size
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -132,7 +138,7 @@ class MainActivity : ComponentActivity() {
                         val result = withContext(Dispatchers.IO) { runCatching { buildPack(name.trim(), animated, picked) } }
                         busy = false
                         result
-                            .onSuccess { status = "$summary\n\n" + Lang.t("wa_opening"); addToWhatsApp(it) }
+                            .onSuccess { queue.clear(); pending = 0; status = "$summary\n\n" + Lang.t("wa_opening"); addToWhatsApp(it) }
                             .onFailure { status = Lang.t("error_with", it.message ?: it.javaClass.simpleName) }
                     }
                 },
@@ -176,7 +182,12 @@ class MainActivity : ComponentActivity() {
                         val result = withContext(Dispatchers.IO) { runCatching { importTelegramPack(token, link) } }
                         busy = false
                         result
-                            .onSuccess { status = "$summary\n\n" + Lang.t("wa_opening"); addToWhatsApp(it) }
+                            .onSuccess { packs ->
+                                queue.clear()
+                                queue.addAll(packs)
+                                totalPacks = packs.size
+                                launchNext()
+                            }
                             .onFailure {
                                 status = if (it is TelegramNetworkException) Lang.t("tg_blocked")
                                 else Lang.t("error_with", it.message ?: it.javaClass.simpleName)
@@ -186,10 +197,23 @@ class MainActivity : ComponentActivity() {
             ) { Text(if (busy) Lang.t("working") else Lang.t("imp_go")) }
 
             if (status.isNotBlank()) Text(status, style = MaterialTheme.typography.bodyLarge)
+            if (pending > 0 && !busy) {
+                Button(onClick = { launchNext() }) { Text(Lang.t("imp_next", pending)) }
+            }
         }
     }
 
-    private fun importTelegramPack(token: String, input: String): StickerPack {
+    /** Opens WhatsApp for the next waiting pack. */
+    private fun launchNext() {
+        val pack = queue.removeFirst()
+        pending = queue.size
+        status = "$summary\n\n" +
+            (if (totalPacks > 1) Lang.t("imp_pack_of", totalPacks - queue.size, totalPacks) else Lang.t("wa_opening"))
+        addToWhatsApp(pack)
+    }
+
+    /** Downloads the whole Telegram pack and builds one or more WhatsApp packs (30 stickers each at most). */
+    private fun importTelegramPack(token: String, input: String): List<StickerPack> {
         val name = TelegramImport.parseName(input) ?: error(Lang.t("imp_bad_link"))
         val set = TelegramImport.fetchSet(token, name)
 
@@ -198,14 +222,10 @@ class MainActivity : ComponentActivity() {
         val videos = set.stickers.filter { it.kind == "video" }
         val tgsCount = set.stickers.count { it.kind == "animated" }
         val animated = videos.size > statics.size
-        var chosen = if (animated) videos else statics
+        val chosen = if (animated) videos else statics
 
         val notes = ArrayList<String>()
         if (tgsCount > 0) notes.add(Lang.t("imp_tgs", tgsCount))
-        if (chosen.size > 30) {
-            chosen = chosen.take(30)
-            notes.add(Lang.t("imp_limit"))
-        }
         if (chosen.size < 3) error(Lang.t("imp_few"))
 
         val work = File(cacheDir, "tgimport_" + UUID.randomUUID()).apply { mkdirs() }
@@ -217,14 +237,36 @@ class MainActivity : ComponentActivity() {
                 TelegramImport.download(token, sticker.fileId, file)
                 uris.add(Uri.fromFile(file))
             }
-            val pack = buildPack(
-                set.title.take(50), animated, uris, chosen.map { it.emoji },
-            ) { uri, out ->
-                if (animated) TelegramImport.convertVideoSticker(this, File(uri.path!!), out)
-                else StickerConverter.convertStatic(this, uri, out)
+
+            // Spread the stickers evenly over as few packs as possible (each pack needs 3 to 30).
+            val packCount = (chosen.size + 29) / 30
+            val perPack = (chosen.size + packCount - 1) / packCount
+            if (packCount > 1) notes.add(Lang.t("imp_split", chosen.size, packCount))
+
+            val packs = ArrayList<StickerPack>()
+            val summaries = ArrayList<String>()
+            var lastError: Exception? = null
+            chosen.chunked(perPack).forEachIndexed { index, group ->
+                val start = index * perPack
+                val title = if (packCount > 1) set.title.take(45) + " " + (index + 1) else set.title.take(50)
+                try {
+                    packs.add(
+                        buildPack(
+                            title, animated, uris.subList(start, start + group.size), group.map { it.emoji },
+                        ) { uri, out ->
+                            if (animated) TelegramImport.convertVideoSticker(this, File(uri.path!!), out)
+                            else StickerConverter.convertStatic(this, uri, out)
+                        },
+                    )
+                    summaries.add(summary)
+                } catch (e: Exception) {
+                    lastError = e
+                    notes.add(Lang.t("imp_pack_failed", index + 1, e.message ?: e.javaClass.simpleName))
+                }
             }
-            if (notes.isNotEmpty()) summary += "\n" + notes.joinToString("\n")
-            return pack
+            if (packs.isEmpty()) throw lastError ?: IllegalStateException(Lang.t("imp_few"))
+            summary = (summaries + notes).joinToString("\n\n")
+            return packs
         } finally {
             work.deleteRecursively()
         }
