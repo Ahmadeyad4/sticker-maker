@@ -60,6 +60,13 @@ private fun tgFlatten(src: Bitmap): Bitmap {
 //  Telegram Bot API client
 // =====================================================================
 
+/** Thrown when Telegram cannot be reached at all (blocked, no internet, VPN not covering the app...). */
+class TelegramNetworkException(message: String) : Exception(message)
+
+private fun tgErrorText(e: Throwable): String =
+    if (e is TelegramNetworkException) Lang.t("tg_blocked")
+    else Lang.t("error") + ": " + (e.message ?: e.javaClass.simpleName)
+
 object TelegramApi {
     /** Calls a Bot API method and returns the JSON answer. Throws with Telegram's own message on errors. */
     fun call(
@@ -114,6 +121,8 @@ object TelegramApi {
                 throw IllegalStateException(json.optString("description", "Telegram error (HTTP $code)"))
             }
             return json
+        } catch (e: java.io.IOException) {
+            throw TelegramNetworkException(e.message ?: "network error")
         } finally {
             conn.disconnect()
         }
@@ -144,7 +153,7 @@ object TelegramPackBuilder {
             val skipped = ArrayList<String>()
             var codecUsed = ""
             uris.forEachIndexed { i, uri ->
-                progress("Converting file ${i + 1} of ${uris.size}...")
+                progress(Lang.t("converting", i + 1, uris.size))
                 val out = File(dir, "s${files.size}." + (if (animated) "webm" else "webp"))
                 try {
                     if (animated) codecUsed = TelegramVideoEncoder.encode(context, uri, out)
@@ -152,10 +161,10 @@ object TelegramPackBuilder {
                     files.add(out)
                 } catch (e: Exception) {
                     out.delete()
-                    skipped.add("file ${i + 1}: ${e.message ?: e.javaClass.simpleName}")
+                    skipped.add(Lang.t("file_n", i + 1) + ": " + (e.message ?: e.javaClass.simpleName))
                 }
             }
-            if (files.isEmpty()) error("No usable files. " + skipped.joinToString("; "))
+            if (files.isEmpty()) error(Lang.t("tg_no_files", skipped.joinToString("; ")))
 
             val name = "pack" + UUID.randomUUID().toString().replace("-", "").take(10) +
                 "_by_" + botUsername.lowercase()
@@ -172,7 +181,7 @@ object TelegramPackBuilder {
                 fileMap["file$i"] = f
             }
 
-            progress("Uploading ${files.size} sticker(s) to Telegram...")
+            progress(Lang.t("uploading", files.size))
             try {
                 TelegramApi.call(
                     token, "createNewStickerSet",
@@ -190,7 +199,7 @@ object TelegramPackBuilder {
                 }
                 throw e
             }
-            val note = if (skipped.isEmpty()) "" else "Skipped ${skipped.size}: ${skipped.joinToString("; ")}"
+            val note = if (skipped.isEmpty()) "" else Lang.t("tg_skipped", skipped.size, skipped.joinToString("; "))
             return TelegramResult("https://t.me/addstickers/$name", note)
         } finally {
             dir.deleteRecursively()
@@ -692,26 +701,21 @@ fun TelegramScreen(onBack: () -> Unit) {
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        TextButton(onClick = onBack) { Text("\u2190 Back") }
-        Text("Telegram stickers", style = MaterialTheme.typography.headlineMedium)
+        TextButton(onClick = onBack) { Text(Lang.t("back")) }
+        Text(Lang.t("tg_stickers"), style = MaterialTheme.typography.headlineMedium)
+        Text(Lang.t("tg_vpn_note"), color = MaterialTheme.colorScheme.error)
 
         if (setupOpen) {
-            Text(
-                "One-time setup (Telegram only lets a bot create sticker packs):\n" +
-                    "1. In Telegram open @BotFather, send /newbot and follow the steps.\n" +
-                    "2. Paste the token it gives you below.\n" +
-                    "3. Open your new bot in Telegram and press Start.\n" +
-                    "4. Tap \"Save and detect my ID\".",
-            )
+            Text(Lang.t("tg_setup"))
             OutlinedTextField(
                 token, { token = it.trim() },
-                label = { Text("Bot token") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                label = { Text(Lang.t("bot_token")) }, singleLine = true, modifier = Modifier.fillMaxWidth(),
             )
             Button(
                 enabled = token.isNotBlank() && !checking,
                 onClick = {
                     checking = true
-                    setupStatus = "Checking the token..."
+                    setupStatus = Lang.t("tg_checking_token")
                     scope.launch {
                         val result = withContext(Dispatchers.IO) {
                             runCatching {
@@ -733,8 +737,7 @@ fun TelegramScreen(onBack: () -> Unit) {
                         result
                             .onSuccess { (uname, id) ->
                                 if (id == 0L) {
-                                    setupStatus = "The token is valid (bot @$uname), but I can't see you yet. " +
-                                        "Open the bot in Telegram, press Start, then tap this button again."
+                                    setupStatus = Lang.t("tg_cant_see", uname)
                                 } else {
                                     prefs.edit().putString("token", token).putLong("userId", id)
                                         .putString("bot", uname).apply()
@@ -744,38 +747,38 @@ fun TelegramScreen(onBack: () -> Unit) {
                                     setupStatus = ""
                                 }
                             }
-                            .onFailure { setupStatus = "Error: ${it.message ?: it.javaClass.simpleName}" }
+                            .onFailure { setupStatus = tgErrorText(it) }
                     }
                 },
-            ) { Text(if (checking) "Checking..." else "Save and detect my ID") }
+            ) { Text(if (checking) Lang.t("checking") else Lang.t("tg_save")) }
             if (setupStatus.isNotBlank()) Text(setupStatus)
         } else {
-            Text("Bot: @$botName")
-            TextButton(onClick = { setupOpen = true }) { Text("Change bot") }
+            Text(Lang.t("bot", botName))
+            TextButton(onClick = { setupOpen = true }) { Text(Lang.t("change_bot")) }
 
             OutlinedTextField(
                 title, { title = it },
-                label = { Text("Pack title") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                label = { Text(Lang.t("pack_title")) }, singleLine = true, modifier = Modifier.fillMaxWidth(),
             )
             OutlinedTextField(
                 emoji, { emoji = it },
-                label = { Text("Emoji for the stickers") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                label = { Text(Lang.t("emoji")) }, singleLine = true, modifier = Modifier.fillMaxWidth(),
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(animated, { animated = it; picked = emptyList() })
                 Spacer(Modifier.width(12.dp))
-                Text(if (animated) "Animated (video sticker, up to 3s)" else "Static (images)")
+                Text(if (animated) Lang.t("animated_tg") else Lang.t("static_tg"))
             }
             Button(onClick = {
                 picker.launch(if (animated) arrayOf("video/*", "image/*") else arrayOf("image/*"))
-            }) { Text("Choose files (${picked.size}) - 1 to 50") }
+            }) { Text(Lang.t("choose_tg", picked.size)) }
 
             Button(
                 enabled = !busy && title.isNotBlank() && emoji.isNotBlank() && picked.size in 1..50,
                 onClick = {
                     busy = true
                     link = ""
-                    status = "Starting..."
+                    status = Lang.t("starting")
                     scope.launch {
                         val r = withContext(Dispatchers.IO) {
                             runCatching {
@@ -787,16 +790,16 @@ fun TelegramScreen(onBack: () -> Unit) {
                         busy = false
                         r.onSuccess {
                             link = it.link
-                            status = ("Done! Your pack is ready.\n" + it.note).trim()
+                            status = (Lang.t("tg_done") + "\n" + it.note).trim()
                             openLink(context, it.link)
-                        }.onFailure { status = "Error: ${it.message ?: it.javaClass.simpleName}" }
+                        }.onFailure { status = tgErrorText(it) }
                     }
                 },
-            ) { Text(if (busy) "Working..." else "Create Telegram pack") }
+            ) { Text(if (busy) Lang.t("working") else Lang.t("create_tg")) }
 
             if (status.isNotBlank()) Text(status)
             if (link.isNotBlank()) {
-                Button(onClick = { openLink(context, link) }) { Text("Open in Telegram") }
+                Button(onClick = { openLink(context, link) }) { Text(Lang.t("open_tg")) }
                 Text(link)
             }
         }
