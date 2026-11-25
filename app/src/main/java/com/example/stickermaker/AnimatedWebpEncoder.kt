@@ -32,8 +32,10 @@ class AnimatedWebpEncoder : AnimatedEncoder {
         Attempt(8, 30, 0.9f), Attempt(8, 20, 0.8f), Attempt(6, 15, 0.7f), Attempt(5, 10, 0.6f),
     )
 
-    override fun encode(context: Context, input: Uri, output: File) {
-        encodeSource(openSource(context, input), output)
+    override fun encode(context: Context, input: Uri, output: File, startMs: Long, lengthMs: Long) {
+        val base = openSource(context, input)
+        val source = if (startMs > 0 || lengthMs > 0) TrimmedSource(base, startMs, lengthMs) else base
+        encodeSource(source, output)
     }
 
     /** Encodes frames that were already decoded to a raw RGBA file (512x512 pixels, [fps] frames per second). */
@@ -185,6 +187,22 @@ class AnimatedWebpEncoder : AnimatedEncoder {
 
         override fun frameAt(ms: Long, scale: Float): Bitmap? =
             StickerConverter.fitOnTransparentSquare(bitmap, SIZE, scale)
+    }
+
+    /** Only the chosen part of another source (it loops inside that part if the sticker is longer). */
+    private class TrimmedSource(private val inner: FrameSource, private val startMs: Long, lengthMs: Long) : FrameSource {
+        override val durationMs: Long
+
+        init {
+            val available = (inner.durationMs - startMs).coerceAtLeast(1L)
+            durationMs = if (lengthMs > 0) min(lengthMs, available) else available
+        }
+
+        override val isStill: Boolean get() = inner.isStill
+
+        override fun frameAt(ms: Long, scale: Float): Bitmap? = inner.frameAt(startMs + ms % durationMs, scale)
+
+        override fun close() = inner.close()
     }
 
     /** Frames stored back to back as raw RGBA (with transparency) in one file. */
