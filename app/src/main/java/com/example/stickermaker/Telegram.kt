@@ -686,6 +686,7 @@ fun TelegramScreen(onBack: () -> Unit) {
     var setupOpen by remember { mutableStateOf(token.isBlank() || userId == 0L) }
     var setupStatus by remember { mutableStateOf("") }
     var checking by remember { mutableStateOf(false) }
+    var confirmDisconnect by remember { mutableStateOf(false) }
 
     var title by remember { mutableStateOf("") }
     var emoji by remember { mutableStateOf("\uD83D\uDE00") }
@@ -696,6 +697,28 @@ fun TelegramScreen(onBack: () -> Unit) {
     var link by remember { mutableStateOf("") }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { picked = it }
+
+    if (confirmDisconnect) {
+        AlertDialog(
+            onDismissRequest = { confirmDisconnect = false },
+            title = { Text(Lang.t("disconnect_title")) },
+            text = { Text(Lang.t("disconnect_text")) },
+            confirmButton = {
+                TextButton(onClick = {
+                    prefs.edit().remove("token").remove("userId").remove("bot").apply()
+                    token = ""
+                    userId = 0L
+                    botName = ""
+                    link = ""
+                    status = ""
+                    setupOpen = true
+                    setupStatus = Lang.t("disconnected")
+                    confirmDisconnect = false
+                }) { Text(Lang.t("disconnect_yes")) }
+            },
+            dismissButton = { TextButton(onClick = { confirmDisconnect = false }) { Text(Lang.t("cancel")) } },
+        )
+    }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
@@ -751,10 +774,21 @@ fun TelegramScreen(onBack: () -> Unit) {
                     }
                 },
             ) { Text(if (checking) Lang.t("checking") else Lang.t("tg_save")) }
+            if ((prefs.getString("token", "") ?: "").isNotBlank()) {
+                // The bot is still linked: allow leaving this form without changing anything.
+                TextButton(onClick = {
+                    token = prefs.getString("token", "") ?: ""
+                    setupOpen = false
+                    setupStatus = ""
+                }) { Text(Lang.t("cancel")) }
+            }
             if (setupStatus.isNotBlank()) Text(setupStatus)
         } else {
             Text(Lang.t("bot", botName))
-            TextButton(onClick = { setupOpen = true }) { Text(Lang.t("change_bot")) }
+            Row {
+                TextButton(onClick = { setupOpen = true }) { Text(Lang.t("change_bot")) }
+                TextButton(onClick = { confirmDisconnect = true }) { Text(Lang.t("disconnect_bot")) }
+            }
 
             OutlinedTextField(
                 title, { title = it },
