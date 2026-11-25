@@ -16,11 +16,12 @@ import kotlin.math.min
 
 /** Converts a GIF / video / image into an animated WebP sticker. */
 interface AnimatedEncoder {
-    fun encode(context: Context, input: Uri, output: File)
+    /** [startMs] / [lengthMs] choose the part of the clip to use (lengthMs 0 = from the start, as long as allowed). */
+    fun encode(context: Context, input: Uri, output: File, startMs: Long, lengthMs: Long)
 }
 
 object NotConfiguredEncoder : AnimatedEncoder {
-    override fun encode(context: Context, input: Uri, output: File) {
+    override fun encode(context: Context, input: Uri, output: File, startMs: Long, lengthMs: Long) {
         throw UnsupportedOperationException("Animated encoder not configured.")
     }
 }
@@ -51,8 +52,8 @@ object StickerConverter {
         error("Image is too complex to fit under 100KB")
     }
 
-    fun convertAnimated(context: Context, input: Uri, output: File) =
-        animatedEncoder.encode(context, input, output)
+    fun convertAnimated(context: Context, input: Uri, output: File, startMs: Long = 0L, lengthMs: Long = 0L) =
+        animatedEncoder.encode(context, input, output, startMs, lengthMs)
 
     fun makeTray(stickerFile: File, output: File) {
         val src = BitmapFactory.decodeFile(stickerFile.path) ?: error("Could not read the tray source image")
