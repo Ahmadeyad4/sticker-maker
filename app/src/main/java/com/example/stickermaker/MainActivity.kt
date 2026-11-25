@@ -112,7 +112,11 @@ class MainActivity : ComponentActivity() {
         var busy by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
 
-        val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { picked = it }
+        val trims = remember { mutableStateMapOf<Uri, Trim>() }
+        val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) {
+            picked = it
+            trims.clear()
+        }
 
         Column(
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
@@ -122,12 +126,17 @@ class MainActivity : ComponentActivity() {
             Text(Lang.t("wa_stickers"), style = MaterialTheme.typography.headlineMedium)
             OutlinedTextField(name, { name = it }, label = { Text(Lang.t("pack_name")) }, modifier = Modifier.fillMaxWidth())
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(animated, { animated = it; picked = emptyList() })
+                Switch(animated, { animated = it; picked = emptyList(); trims.clear() })
                 Spacer(Modifier.width(12.dp))
                 Text(if (animated) Lang.t("animated_wa") else Lang.t("static_wa"))
             }
             Button(onClick = { picker.launch(if (animated) arrayOf("video/*", "image/*") else arrayOf("image/*")) }) {
                 Text(Lang.t("choose_wa", picked.size))
+            }
+
+            if (animated && picked.isNotEmpty()) {
+                Text(Lang.t("trim_hint"))
+                picked.forEachIndexed { i, uri -> TrimRow(i + 1, uri, 9500L, trims) }
             }
             Button(
                 enabled = !busy && name.isNotBlank() && picked.size in 3..30,
@@ -135,7 +144,7 @@ class MainActivity : ComponentActivity() {
                     busy = true
                     status = Lang.t("starting")
                     scope.launch {
-                        val result = withContext(Dispatchers.IO) { runCatching { buildPack(name.trim(), animated, picked) } }
+                        val result = withContext(Dispatchers.IO) { runCatching { buildPack(name.trim(), animated, picked, trims = trims.toMap()) } }
                         busy = false
                         result
                             .onSuccess { queue.clear(); pending = 0; status = "$summary\n\n" + Lang.t("wa_opening"); addToWhatsApp(it) }
@@ -282,6 +291,7 @@ class MainActivity : ComponentActivity() {
         animated: Boolean,
         uris: List<Uri>,
         emojis: List<String> = emptyList(),
+        trims: Map<Uri, Trim> = emptyMap(),
         converter: ((Uri, File) -> Unit)? = null,
     ): StickerPack {
         val store = StickerStore(this)
@@ -296,7 +306,7 @@ class MainActivity : ComponentActivity() {
                 try {
                     when {
                         converter != null -> converter(uri, file)
-                        animated -> StickerConverter.convertAnimated(this, uri, file)
+                        animated -> StickerConverter.convertAnimated(this, uri, file, trims[uri]?.startMs ?: 0L, trims[uri]?.lengthMs ?: 0L)
                         else -> StickerConverter.convertStatic(this, uri, file)
                     }
                     StickerValidator.check(file, animated)?.let { error(it) }
