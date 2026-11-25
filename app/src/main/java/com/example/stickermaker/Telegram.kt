@@ -145,6 +145,7 @@ object TelegramPackBuilder {
         animated: Boolean,
         emoji: String,
         uris: List<Uri>,
+        trims: Map<Uri, Trim>,
         progress: (String) -> Unit,
     ): TelegramResult {
         val dir = File(context.cacheDir, "tg_" + UUID.randomUUID()).apply { mkdirs() }
@@ -156,7 +157,7 @@ object TelegramPackBuilder {
                 progress(Lang.t("converting", i + 1, uris.size))
                 val out = File(dir, "s${files.size}." + (if (animated) "webm" else "webp"))
                 try {
-                    if (animated) codecUsed = TelegramVideoEncoder.encode(context, uri, out)
+                    if (animated) codecUsed = TelegramVideoEncoder.encode(context, uri, out, trims[uri]?.startMs ?: 0L, trims[uri]?.lengthMs ?: 0L)
                     else TelegramStatic.convert(context, uri, out)
                     files.add(out)
                 } catch (e: Exception) {
@@ -333,7 +334,7 @@ object TelegramVideoEncoder {
      * 3) Else: the phone's own encoder only (VP9 if it has one, otherwise VP8 which Telegram rejects).
      * Returns "VP9", or "VP8" in the last case.
      */
-    fun encode(context: Context, input: Uri, output: File): String {
+    fun encode(context: Context, input: Uri, output: File, startMs: Long = 0L, lengthMs: Long = 0L): String {
         val ffOk = ffmpegOk
         val rawMode = ffOk && rawInputWorks(context)
         val enc = if (rawMode) null else findEncoder()
@@ -349,7 +350,8 @@ object TelegramVideoEncoder {
             val rawOut = if (rawMode) rawFile.outputStream().buffered() else null
             val yuv = ArrayList<ByteArray>()
             var count = 0
-            val source = openSource(context, input)
+            val base = openSource(context, input)
+            val source = if (startMs > 0 || lengthMs > 0) TgTrimmedSource(base, startMs, lengthMs) else base
             try {
                 val durationMs = if (source.isStill) 1000L else min(max(source.durationMs, 1000L), TG_MAX_MS)
                 val total = max(2, (durationMs * TG_FPS / 1000).toInt())
@@ -653,6 +655,22 @@ object TelegramVideoEncoder {
         }
     }
 
+    /** Only the chosen part of another source (it loops inside that part if needed). */
+    private class TgTrimmedSource(private val inner: TgSource, private val startMs: Long, lengthMs: Long) : TgSource {
+        override val durationMs: Long
+
+        init {
+            val available = (inner.durationMs - startMs).coerceAtLeast(1L)
+            durationMs = if (lengthMs > 0) min(lengthMs, available) else available
+        }
+
+        override val isStill: Boolean get() = inner.isStill
+
+        override fun frameAt(ms: Long): Bitmap? = inner.frameAt(startMs + ms % durationMs)
+
+        override fun close() = inner.close()
+    }
+
     private class TgStillSource(context: Context, uri: Uri) : TgSource {
         private val bitmap: Bitmap = StickerConverter.decode(context, uri)
         override val durationMs: Long = 1000L
@@ -696,7 +714,11 @@ fun TelegramScreen(onBack: () -> Unit) {
     var status by remember { mutableStateOf("") }
     var link by remember { mutableStateOf("") }
 
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { picked = it }
+    val trims = remember { mutableStateMapOf<Uri, Trim>() }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) {
+        picked = it
+        trims.clear()
+    }
 
     if (confirmDisconnect) {
         AlertDialog(
@@ -799,13 +821,18 @@ fun TelegramScreen(onBack: () -> Unit) {
                 label = { Text(Lang.t("emoji")) }, singleLine = true, modifier = Modifier.fillMaxWidth(),
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(animated, { animated = it; picked = emptyList() })
+                Switch(animated, { animated = it; picked = emptyList(); trims.clear() })
                 Spacer(Modifier.width(12.dp))
                 Text(if (animated) Lang.t("animated_tg") else Lang.t("static_tg"))
             }
             Button(onClick = {
                 picker.launch(if (animated) arrayOf("video/*", "image/*") else arrayOf("image/*"))
             }) { Text(Lang.t("choose_tg", picked.size)) }
+
+            if (animated && picked.isNotEmpty()) {
+                Text(Lang.t("trim_hint"))
+                picked.forEachIndexed { i, uri -> TrimRow(i + 1, uri, TG_MAX_MS, trims) }
+            }
 
             Button(
                 enabled = !busy && title.isNotBlank() && emoji.isNotBlank() && picked.size in 1..50,
@@ -817,7 +844,7 @@ fun TelegramScreen(onBack: () -> Unit) {
                         val r = withContext(Dispatchers.IO) {
                             runCatching {
                                 TelegramPackBuilder.create(
-                                    context, token, userId, botName, title.trim(), animated, emoji.trim(), picked,
+                                    context, token, userId, botName, title.trim(), animated, emoji.trim(), picked, trims.toMap(),
                                 ) { status = it }
                             }
                         }
