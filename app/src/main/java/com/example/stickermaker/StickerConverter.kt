@@ -17,11 +17,11 @@ import kotlin.math.min
 /** Converts a GIF / video / image into an animated WebP sticker. */
 interface AnimatedEncoder {
     /** [startMs] / [lengthMs] choose the part of the clip to use (lengthMs 0 = from the start, as long as allowed). */
-    fun encode(context: Context, input: Uri, output: File, startMs: Long, lengthMs: Long)
+    fun encode(context: Context, input: Uri, output: File, startMs: Long, lengthMs: Long, caption: String)
 }
 
 object NotConfiguredEncoder : AnimatedEncoder {
-    override fun encode(context: Context, input: Uri, output: File, startMs: Long, lengthMs: Long) {
+    override fun encode(context: Context, input: Uri, output: File, startMs: Long, lengthMs: Long, caption: String) {
         throw UnsupportedOperationException("Animated encoder not configured.")
     }
 }
@@ -37,10 +37,11 @@ object StickerConverter {
      * Any readable image -> 512x512 WebP under 100KB.
      * Too big? Lowers quality first, then shrinks the picture inside the canvas.
      */
-    fun convertStatic(context: Context, input: Uri, output: File) {
+    fun convertStatic(context: Context, input: Uri, output: File, caption: String = "") {
         val src = decode(context, input)
         for (scale in floatArrayOf(1f, 0.85f, 0.7f, 0.55f)) {
             val bmp = fitOnTransparentSquare(src, STICKER_SIZE, scale)
+            Caption.draw(bmp, caption)
             for (quality in 90 downTo 10 step 10) {
                 val bytes = ByteArrayOutputStream().also { bmp.compress(webpFormat(), quality, it) }.toByteArray()
                 if (bytes.size <= MAX_STATIC_BYTES) {
@@ -52,8 +53,10 @@ object StickerConverter {
         error("Image is too complex to fit under 100KB")
     }
 
-    fun convertAnimated(context: Context, input: Uri, output: File, startMs: Long = 0L, lengthMs: Long = 0L) =
-        animatedEncoder.encode(context, input, output, startMs, lengthMs)
+    fun convertAnimated(
+        context: Context, input: Uri, output: File,
+        startMs: Long = 0L, lengthMs: Long = 0L, caption: String = "",
+    ) = animatedEncoder.encode(context, input, output, startMs, lengthMs, caption)
 
     fun makeTray(stickerFile: File, output: File) {
         val src = BitmapFactory.decodeFile(stickerFile.path) ?: error("Could not read the tray source image")

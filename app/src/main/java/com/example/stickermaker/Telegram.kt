@@ -63,7 +63,7 @@ private fun tgFlatten(src: Bitmap): Bitmap {
 /** Thrown when Telegram cannot be reached at all (blocked, no internet, VPN not covering the app...). */
 class TelegramNetworkException(message: String) : Exception(message)
 
-private fun tgErrorText(e: Throwable): String =
+fun tgErrorText(e: Throwable): String =
     if (e is TelegramNetworkException) Lang.t("tg_blocked")
     else Lang.t("error_with", e.message ?: e.javaClass.simpleName)
 
@@ -133,9 +133,56 @@ object TelegramApi {
 //  Building a pack
 // =====================================================================
 
-data class TelegramResult(val link: String, val note: String)
+data class TelegramResult(val link: String, val note: String, val name: String = "")
+
+private class Converted(
+    val files: List<File>,
+    val emojis: List<List<String>>,
+    val skipped: List<String>,
+    val codec: String,
+)
 
 object TelegramPackBuilder {
+
+    /** Converts every picked file into a Telegram sticker file inside [dir]. Files that fail are skipped. */
+    private fun convertAll(
+        context: Context,
+        dir: File,
+        animated: Boolean,
+        defaultEmoji: String,
+        uris: List<Uri>,
+        emojis: List<String>,
+        captions: List<String>,
+        trims: Map<Uri, Trim>,
+        progress: (String) -> Unit,
+    ): Converted {
+        val files = ArrayList<File>()
+        val fileEmojis = ArrayList<List<String>>()
+        val skipped = ArrayList<String>()
+        var codecUsed = ""
+        uris.forEachIndexed { i, uri ->
+            progress(Lang.t("converting", i + 1, uris.size))
+            val out = File(dir, "s${files.size}." + (if (animated) "webm" else "webp"))
+            val caption = captions.getOrNull(i) ?: ""
+            try {
+                if (animated) {
+                    codecUsed = TelegramVideoEncoder.encode(
+                        context, uri, out, trims[uri]?.startMs ?: 0L, trims[uri]?.lengthMs ?: 0L, caption,
+                    )
+                } else {
+                    TelegramStatic.convert(context, uri, out, caption)
+                }
+                files.add(out)
+                fileEmojis.add(Emoji.forTelegram(emojis.getOrNull(i) ?: "", defaultEmoji))
+            } catch (e: Exception) {
+                out.delete()
+                skipped.add(Lang.t("file_err", i + 1, e.message ?: e.javaClass.simpleName))
+            }
+        }
+        return Converted(files, fileEmojis, skipped, codecUsed)
+    }
+
+    /** Makes a new sticker pack owned by the user. */
     fun create(
         context: Context,
         token: String,
@@ -143,46 +190,34 @@ object TelegramPackBuilder {
         botUsername: String,
         title: String,
         animated: Boolean,
-        emoji: String,
+        defaultEmoji: String,
         uris: List<Uri>,
+        emojis: List<String>,
+        captions: List<String>,
         trims: Map<Uri, Trim>,
         progress: (String) -> Unit,
     ): TelegramResult {
         val dir = File(context.cacheDir, "tg_" + UUID.randomUUID()).apply { mkdirs() }
         try {
-            val files = ArrayList<File>()
-            val skipped = ArrayList<String>()
-            var codecUsed = ""
-            uris.forEachIndexed { i, uri ->
-                progress(Lang.t("converting", i + 1, uris.size))
-                val out = File(dir, "s${files.size}." + (if (animated) "webm" else "webp"))
-                try {
-                    if (animated) codecUsed = TelegramVideoEncoder.encode(context, uri, out, trims[uri]?.startMs ?: 0L, trims[uri]?.lengthMs ?: 0L)
-                    else TelegramStatic.convert(context, uri, out)
-                    files.add(out)
-                } catch (e: Exception) {
-                    out.delete()
-                    skipped.add(Lang.t("file_err", i + 1, e.message ?: e.javaClass.simpleName))
-                }
-            }
-            if (files.isEmpty()) error(Lang.t("tg_no_files", skipped.joinToString("; ")))
+            val c = convertAll(context, dir, animated, defaultEmoji, uris, emojis, captions, trims, progress)
+            if (c.files.isEmpty()) error(Lang.t("tg_no_files", c.skipped.joinToString("; ")))
 
             val name = "pack" + UUID.randomUUID().toString().replace("-", "").take(10) +
                 "_by_" + botUsername.lowercase()
             val format = if (animated) "video" else "static"
             val stickers = JSONArray()
             val fileMap = LinkedHashMap<String, File>()
-            files.forEachIndexed { i, f ->
+            c.files.forEachIndexed { i, f ->
                 stickers.put(
                     JSONObject()
                         .put("sticker", "attach://file$i")
                         .put("format", format)
-                        .put("emoji_list", JSONArray().put(emoji)),
+                        .put("emoji_list", JSONArray(c.emojis[i])),
                 )
                 fileMap["file$i"] = f
             }
 
-            progress(Lang.t("uploading", files.size))
+            progress(Lang.t("uploading", c.files.size))
             try {
                 TelegramApi.call(
                     token, "createNewStickerSet",
@@ -195,13 +230,52 @@ object TelegramPackBuilder {
                     fileMap,
                 )
             } catch (e: Exception) {
-                if (codecUsed == "VP8" && (e.message ?: "").contains("STICKER_VIDEO")) {
+                if (c.codec == "VP8" && (e.message ?: "").contains("STICKER_VIDEO")) {
                     throw IllegalStateException("${e.message} (this phone can only encode VP8, and Telegram asks for VP9)")
                 }
                 throw e
             }
-            val note = if (skipped.isEmpty()) "" else Lang.t("tg_skipped", skipped.size, skipped.joinToString("; "))
-            return TelegramResult("https://t.me/addstickers/$name", note)
+            val note = if (c.skipped.isEmpty()) "" else Lang.t("tg_skipped", c.skipped.size, c.skipped.joinToString("; "))
+            return TelegramResult("https://t.me/addstickers/$name", note, name)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    /** Adds more stickers to a pack that already exists (one call per sticker). */
+    fun addToSet(
+        context: Context,
+        token: String,
+        userId: Long,
+        setName: String,
+        animated: Boolean,
+        defaultEmoji: String,
+        uris: List<Uri>,
+        emojis: List<String>,
+        captions: List<String>,
+        trims: Map<Uri, Trim>,
+        progress: (String) -> Unit,
+    ): TelegramResult {
+        val dir = File(context.cacheDir, "tg_" + UUID.randomUUID()).apply { mkdirs() }
+        try {
+            val c = convertAll(context, dir, animated, defaultEmoji, uris, emojis, captions, trims, progress)
+            if (c.files.isEmpty()) error(Lang.t("tg_no_files", c.skipped.joinToString("; ")))
+
+            val format = if (animated) "video" else "static"
+            c.files.forEachIndexed { i, f ->
+                progress(Lang.t("adding_n", i + 1, c.files.size))
+                val sticker = JSONObject()
+                    .put("sticker", "attach://file0")
+                    .put("format", format)
+                    .put("emoji_list", JSONArray(c.emojis[i]))
+                TelegramApi.call(
+                    token, "addStickerToSet",
+                    mapOf("user_id" to userId.toString(), "name" to setName, "sticker" to sticker.toString()),
+                    mapOf("file0" to f),
+                )
+            }
+            val note = if (c.skipped.isEmpty()) "" else Lang.t("tg_skipped", c.skipped.size, c.skipped.joinToString("; "))
+            return TelegramResult("https://t.me/addstickers/$setName", note, setName)
         } finally {
             dir.deleteRecursively()
         }
@@ -213,9 +287,10 @@ object TelegramPackBuilder {
 // =====================================================================
 
 object TelegramStatic {
-    fun convert(context: Context, input: Uri, output: File) {
+    fun convert(context: Context, input: Uri, output: File, caption: String = "") {
         val src = StickerConverter.decode(context, input)
         val bmp = StickerConverter.fitOnTransparentSquare(src, TG_SIZE)
+        Caption.draw(bmp, caption)
         for (quality in intArrayOf(95, 85, 70, 55, 40, 25)) {
             val bytes = ByteArrayOutputStream().also { bmp.compress(StickerConverter.webpFormat(), quality, it) }.toByteArray()
             if (bytes.size <= 500_000) {
@@ -334,7 +409,10 @@ object TelegramVideoEncoder {
      * 3) Else: the phone's own encoder only (VP9 if it has one, otherwise VP8 which Telegram rejects).
      * Returns "VP9", or "VP8" in the last case.
      */
-    fun encode(context: Context, input: Uri, output: File, startMs: Long = 0L, lengthMs: Long = 0L): String {
+    fun encode(
+        context: Context, input: Uri, output: File,
+        startMs: Long = 0L, lengthMs: Long = 0L, caption: String = "",
+    ): String {
         val ffOk = ffmpegOk
         val rawMode = ffOk && rawInputWorks(context)
         val enc = if (rawMode) null else findEncoder()
@@ -362,6 +440,7 @@ object TelegramVideoEncoder {
                         continue
                     }
                     val bmp = source.frameAt(i * 1000L / TG_FPS) ?: continue
+                    Caption.draw(bmp, caption)
                     if (rawOut != null) {
                         writeRawFrame(bmp, rawOut)
                         bmp.recycle()
@@ -684,7 +763,7 @@ object TelegramVideoEncoder {
 //  Screen
 // =====================================================================
 
-private fun openLink(context: Context, url: String) {
+fun openLink(context: Context, url: String) {
     try {
         context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
     } catch (e: Exception) {
@@ -693,7 +772,7 @@ private fun openLink(context: Context, url: String) {
 }
 
 @Composable
-fun TelegramScreen(onBack: () -> Unit) {
+fun TelegramScreen(onBack: () -> Unit, initial: List<Uri> = emptyList(), target: TgSetRef? = null) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("telegram", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
@@ -708,16 +787,17 @@ fun TelegramScreen(onBack: () -> Unit) {
 
     var title by remember { mutableStateOf("") }
     var emoji by remember { mutableStateOf("\uD83D\uDE00") }
-    var animated by remember { mutableStateOf(false) }
-    var picked by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var animated by remember { mutableStateOf(target?.animated ?: initial.any { context.looksAnimated(it) }) }
+    var picked by remember { mutableStateOf(initial) }
+    val trims = remember { mutableStateMapOf<Uri, Trim>() }
+    val emojis = remember { mutableStateMapOf<Uri, String>() }
+    val captions = remember { mutableStateMapOf<Uri, String>() }
     var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
     var link by remember { mutableStateOf("") }
 
-    val trims = remember { mutableStateMapOf<Uri, Trim>() }
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) {
-        picked = it
-        trims.clear()
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { list ->
+        picked = (picked + list).distinct().take(50)
     }
 
     if (confirmDisconnect) {
@@ -727,7 +807,7 @@ fun TelegramScreen(onBack: () -> Unit) {
             text = { Text(Lang.t("disconnect_text")) },
             confirmButton = {
                 TextButton(onClick = {
-                    prefs.edit().remove("token").remove("userId").remove("bot").apply()
+                    prefs.edit().remove("token").remove("userId").remove("bot").remove("sets").apply()
                     token = ""
                     userId = 0L
                     botName = ""
@@ -812,51 +892,88 @@ fun TelegramScreen(onBack: () -> Unit) {
                 TextButton(onClick = { confirmDisconnect = true }) { Text(Lang.t("disconnect_bot")) }
             }
 
-            OutlinedTextField(
-                title, { title = it },
-                label = { Text(Lang.t("pack_title")) }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-            )
+            if (target != null) {
+                Text(Lang.t("tg_adding_to", target.title), style = MaterialTheme.typography.titleMedium)
+            } else {
+                OutlinedTextField(
+                    title, { title = it },
+                    label = { Text(Lang.t("pack_title")) }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                )
+            }
             OutlinedTextField(
                 emoji, { emoji = it },
                 label = { Text(Lang.t("emoji")) }, singleLine = true, modifier = Modifier.fillMaxWidth(),
             )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(animated, { animated = it; picked = emptyList(); trims.clear() })
-                Spacer(Modifier.width(12.dp))
-                Text(if (animated) Lang.t("animated_tg") else Lang.t("static_tg"))
+            if (target == null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(animated, {
+                        animated = it
+                        picked = emptyList()
+                        trims.clear()
+                        emojis.clear()
+                        captions.clear()
+                    })
+                    Spacer(Modifier.width(12.dp))
+                    Text(if (animated) Lang.t("animated_tg") else Lang.t("static_tg"))
+                }
             }
             Button(onClick = {
                 picker.launch(if (animated) arrayOf("video/*", "image/*") else arrayOf("image/*"))
             }) { Text(Lang.t("choose_tg", picked.size)) }
 
-            if (animated && picked.isNotEmpty()) {
-                Text(Lang.t("trim_hint"))
-                picked.forEachIndexed { i, uri -> TrimRow(i + 1, uri, TG_MAX_MS, trims) }
+            if (picked.isNotEmpty()) {
+                StickerEditor(
+                    picked = picked,
+                    onPickedChange = { picked = it },
+                    animated = animated,
+                    maxLengthMs = TG_MAX_MS,
+                    trims = trims,
+                    emojis = emojis,
+                    captions = captions,
+                )
             }
 
             Button(
-                enabled = !busy && title.isNotBlank() && emoji.isNotBlank() && picked.size in 1..50,
+                enabled = !busy && (target != null || title.isNotBlank()) && emoji.isNotBlank() && picked.size in 1..50,
                 onClick = {
                     busy = true
                     link = ""
                     status = Lang.t("starting")
                     scope.launch {
+                        val uris = picked
+                        val emojiList = uris.map { emojis[it] ?: "" }
+                        val captionList = uris.map { captions[it] ?: "" }
                         val r = withContext(Dispatchers.IO) {
                             runCatching {
-                                TelegramPackBuilder.create(
-                                    context, token, userId, botName, title.trim(), animated, emoji.trim(), picked, trims.toMap(),
-                                ) { status = it }
+                                if (target == null) {
+                                    TelegramPackBuilder.create(
+                                        context, token, userId, botName, title.trim(), animated, emoji.trim(),
+                                        uris, emojiList, captionList, trims.toMap(),
+                                    ) { status = it }
+                                } else {
+                                    TelegramPackBuilder.addToSet(
+                                        context, token, userId, target.name, animated, emoji.trim(),
+                                        uris, emojiList, captionList, trims.toMap(),
+                                    ) { status = it }
+                                }
                             }
                         }
                         busy = false
                         r.onSuccess {
                             link = it.link
-                            status = (Lang.t("tg_done") + "\n" + it.note).trim()
-                            openLink(context, it.link)
+                            if (target == null) TgSetStore.add(context, TgSetRef(it.name, title.trim(), animated))
+                            status = (Lang.t(if (target == null) "tg_done" else "tg_added") + "\n" + it.note).trim()
+                            if (target == null) openLink(context, it.link)
                         }.onFailure { status = tgErrorText(it) }
                     }
                 },
-            ) { Text(if (busy) Lang.t("working") else Lang.t("create_tg")) }
+            ) {
+                Text(
+                    if (busy) Lang.t("working")
+                    else if (target != null) Lang.t("tg_add_btn")
+                    else Lang.t("create_tg"),
+                )
+            }
 
             if (status.isNotBlank()) Text(status)
             if (link.isNotBlank()) {

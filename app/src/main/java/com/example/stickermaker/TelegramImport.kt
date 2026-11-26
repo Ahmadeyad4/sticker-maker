@@ -2,11 +2,14 @@ package com.example.stickermaker
 
 import android.content.Context
 import android.net.Uri
+import com.airbnb.lottie.LottieComposition
+import com.airbnb.lottie.LottieCompositionFactory
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.zip.GZIPInputStream
 
 /** "static" (WebP), "video" (WebM) or "animated" (TGS / Lottie, which cannot be converted). */
 data class TgSticker(val fileId: String, val emoji: String, val kind: String)
@@ -75,6 +78,15 @@ object TelegramImport {
         }
         raw.delete()
         if (!done) StickerConverter.convertAnimated(context, Uri.fromFile(webm), output)
+    }
+
+    /** Telegram animated sticker (.tgs = gzip-compressed Lottie) -> animated WebP for WhatsApp, with transparency. */
+    fun convertTgsSticker(tgs: File, output: File) {
+        val json = GZIPInputStream(tgs.inputStream().buffered()).use { it.readBytes().toString(Charsets.UTF_8) }
+        val result = LottieCompositionFactory.fromJsonStringSync(json, null)
+        val composition: LottieComposition = result.value
+            ?: throw IllegalStateException("Could not read this animated sticker: " + (result.exception?.message ?: ""))
+        AnimatedWebpEncoder().encodeLottie(composition, output)
     }
 
     private fun decodeToRaw(webm: File, raw: File): Boolean = try {

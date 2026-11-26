@@ -6,6 +6,8 @@ import android.graphics.Canvas
 import android.graphics.Movie
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import com.airbnb.lottie.LottieComposition
+import com.airbnb.lottie.LottieDrawable
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile
@@ -32,18 +34,23 @@ class AnimatedWebpEncoder : AnimatedEncoder {
         Attempt(8, 30, 0.9f), Attempt(8, 20, 0.8f), Attempt(6, 15, 0.7f), Attempt(5, 10, 0.6f),
     )
 
-    override fun encode(context: Context, input: Uri, output: File, startMs: Long, lengthMs: Long) {
+    override fun encode(context: Context, input: Uri, output: File, startMs: Long, lengthMs: Long, caption: String) {
         val base = openSource(context, input)
         val source = if (startMs > 0 || lengthMs > 0) TrimmedSource(base, startMs, lengthMs) else base
-        encodeSource(source, output)
+        encodeSource(source, output, caption)
     }
 
     /** Encodes frames that were already decoded to a raw RGBA file (512x512 pixels, [fps] frames per second). */
     fun encodeRaw(rawFile: File, fps: Int, output: File) {
-        encodeSource(RawSource(rawFile, fps), output)
+        encodeSource(RawSource(rawFile, fps), output, "")
     }
 
-    private fun encodeSource(source: FrameSource, output: File) {
+    /** Renders a Telegram TGS (Lottie) animation, with transparency, into an animated WebP. */
+    fun encodeLottie(composition: LottieComposition, output: File) {
+        encodeSource(LottieSource(composition), output, "")
+    }
+
+    private fun encodeSource(source: FrameSource, output: File, caption: String) {
         try {
             val durationMs = if (source.isStill) MIN_DURATION_MS
             else min(max(source.durationMs, MIN_DURATION_MS), MAX_DURATION_MS)
@@ -55,7 +62,7 @@ class AnimatedWebpEncoder : AnimatedEncoder {
             }
 
             for (a in attempts) {
-                val webp = tryEncode(source, durationMs, a) ?: continue
+                val webp = tryEncode(source, durationMs, a, caption) ?: continue
                 output.writeBytes(webp)
                 StickerValidator.check(output, animated = true)?.let { error(it) }
                 return
@@ -69,10 +76,11 @@ class AnimatedWebpEncoder : AnimatedEncoder {
     private fun compress(bmp: Bitmap, quality: Int): ByteArray =
         ByteArrayOutputStream().also { bmp.compress(StickerConverter.webpFormat(), quality, it) }.toByteArray()
 
-    private fun tryEncode(source: FrameSource, durationMs: Long, a: Attempt): ByteArray? {
+    private fun tryEncode(source: FrameSource, durationMs: Long, a: Attempt, caption: String): ByteArray? {
         if (source.isStill) {
             // A plain image becomes a 2-frame animation (WhatsApp needs more than one frame).
             val bmp = source.frameAt(0, a.scale) ?: return null
+            Caption.draw(bmp, caption)
             val bytes = compress(bmp, a.quality)
             bmp.recycle()
             val out = WebpMuxer.mux(listOf(bytes, bytes), SIZE, 500)
@@ -85,6 +93,7 @@ class AnimatedWebpEncoder : AnimatedEncoder {
         var total = 0
         for (i in 0 until count) {
             val bmp = source.frameAt(i.toLong() * frameMs, a.scale) ?: continue
+            Caption.draw(bmp, caption)
             val bytes = compress(bmp, a.quality)
             bmp.recycle()
             total += bytes.size
@@ -203,6 +212,30 @@ class AnimatedWebpEncoder : AnimatedEncoder {
         override fun frameAt(ms: Long, scale: Float): Bitmap? = inner.frameAt(startMs + ms % durationMs, scale)
 
         override fun close() = inner.close()
+    }
+
+    /** A Lottie animation drawn frame by frame onto a transparent picture. */
+    private class LottieSource(composition: LottieComposition) : FrameSource {
+        private val drawable = LottieDrawable()
+        override val durationMs: Long = composition.duration.toLong().coerceAtLeast(1L)
+
+        init {
+            drawable.setComposition(composition)
+            drawable.setBounds(0, 0, SIZE, SIZE)
+        }
+
+        override fun frameAt(ms: Long, scale: Float): Bitmap? {
+            drawable.setProgress((ms % durationMs).toFloat() / durationMs)
+            val bmp = Bitmap.createBitmap(SIZE, SIZE, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            if (scale < 0.999f) {
+                val offset = SIZE * (1f - scale) / 2f
+                canvas.translate(offset, offset)
+                canvas.scale(scale, scale)
+            }
+            drawable.draw(canvas)
+            return bmp
+        }
     }
 
     /** Frames stored back to back as raw RGBA (with transparency) in one file. */

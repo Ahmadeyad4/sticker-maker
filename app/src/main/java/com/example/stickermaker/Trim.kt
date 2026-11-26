@@ -57,7 +57,11 @@ object TrimSupport {
     /** A small preview picture of the clip at [ms]. */
     fun thumbnail(context: Context, uri: Uri, ms: Long): Bitmap? = try {
         val type = context.contentResolver.getType(uri) ?: ""
-        val raw: Bitmap? = if (type == "image/gif") gifFrame(context, uri, ms) else videoFrame(context, uri, ms)
+        val raw: Bitmap? = when {
+            type == "image/gif" -> gifFrame(context, uri, ms)
+            type.startsWith("image/") -> StickerConverter.decode(context, uri)
+            else -> videoFrame(context, uri, ms)
+        }
         raw?.let { shrink(it, 200) }
     } catch (e: Exception) {
         null

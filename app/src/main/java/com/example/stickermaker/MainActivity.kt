@@ -17,6 +17,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.unit.LayoutDirection
@@ -40,6 +41,10 @@ class MainActivity : ComponentActivity() {
     private var totalPacks = 0
     private var pending by mutableStateOf(0)
 
+    // Files or a pack link shared to this app from the gallery, Telegram, etc.
+    private var sharedUris by mutableStateOf<List<Uri>>(emptyList())
+    private var sharedLink by mutableStateOf("")
+
     private val addLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             val err = result.data?.getStringExtra("validation_error")
@@ -48,7 +53,7 @@ class MainActivity : ComponentActivity() {
                 err != null -> Lang.t("wa_rejected", err)
                 else -> Lang.t("wa_not_added")
             }
-            status = "$summary\n\n$answer"
+            status = (summary + "\n\n" + answer).trim()
             if (result.resultCode == RESULT_OK && queue.isNotEmpty()) launchNext() else pending = queue.size
         }
 
@@ -56,22 +61,112 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         Lang.load(this)
         StickerConverter.animatedEncoder = AnimatedWebpEncoder()
+        handleShare(intent)
         setContent { MaterialTheme { Screen() } }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShare(intent)
+    }
+
+    /** Picks up pictures, videos, GIFs or a Telegram pack link that another app shared with us. */
+    @Suppress("DEPRECATION")
+    private fun handleShare(intent: Intent?) {
+        if (intent == null) return
+        when (intent.action) {
+            Intent.ACTION_SEND -> {
+                val uri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+                val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+                if (uri != null) {
+                    sharedUris = listOf(uri)
+                } else if (text != null && (text.contains("addstickers/") || text.contains("set="))) {
+                    sharedLink = text
+                }
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                val list = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+                if (!list.isNullOrEmpty()) sharedUris = list
+            }
+        }
     }
 
     @Composable
     private fun Screen() {
         var mode by remember { mutableStateOf("home") }
-        BackHandler(enabled = mode != "home") { mode = "home"; status = "" }
+        var startUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+        var startLink by remember { mutableStateOf("") }
+        var tgTarget by remember { mutableStateOf<TgSetRef?>(null) }
+
+        val goBack: () -> Unit = {
+            val next = if (mode == "telegram" && tgTarget != null) "manage" else "home"
+            tgTarget = null
+            startUris = emptyList()
+            startLink = ""
+            status = ""
+            mode = next
+        }
+        BackHandler(enabled = mode != "home") { goBack() }
+
+        // A pack link shared from Telegram goes straight to the "move to WhatsApp" screen.
+        LaunchedEffect(sharedLink) {
+            if (sharedLink.isNotBlank()) {
+                startLink = sharedLink
+                sharedLink = ""
+                mode = "import"
+            }
+        }
+
         // Arabic is written right-to-left, so the whole layout is mirrored.
         CompositionLocalProvider(
             LocalLayoutDirection provides (if (Lang.isArabic) LayoutDirection.Rtl else LayoutDirection.Ltr),
         ) {
-            when (mode) {
-                "whatsapp" -> WhatsAppScreen { mode = "home"; status = "" }
-                "import" -> ImportScreen { mode = "home"; status = "" }
-                "telegram" -> TelegramScreen { mode = "home" }
-                else -> HomeScreen { mode = it }
+            key(startUris, startLink, tgTarget) {
+                when (mode) {
+                    "whatsapp" -> WhatsAppScreen(startUris, goBack)
+                    "import" -> ImportScreen(startLink, goBack)
+                    "telegram" -> TelegramScreen(goBack, startUris, tgTarget)
+                    "manage" -> ManageScreen(
+                        statusText = status,
+                        onBack = goBack,
+                        onReadd = { pack ->
+                            queue.clear()
+                            pending = 0
+                            summary = ""
+                            status = Lang.t("wa_opening")
+                            addToWhatsApp(pack)
+                        },
+                        onAddToSet = { ref ->
+                            tgTarget = ref
+                            mode = "telegram"
+                        },
+                    )
+                    else -> HomeScreen { mode = it }
+                }
+            }
+
+            if (sharedUris.isNotEmpty()) {
+                AlertDialog(
+                    onDismissRequest = { sharedUris = emptyList() },
+                    title = { Text(Lang.t("share_title")) },
+                    text = { Text(Lang.t("share_text", sharedUris.size)) },
+                    confirmButton = {
+                        Row {
+                            TextButton(onClick = {
+                                startUris = sharedUris
+                                sharedUris = emptyList()
+                                mode = "whatsapp"
+                            }) { Text(Lang.t("wa_stickers")) }
+                            TextButton(onClick = {
+                                startUris = sharedUris
+                                sharedUris = emptyList()
+                                mode = "telegram"
+                            }) { Text(Lang.t("tg_stickers")) }
+                        }
+                    },
+                    dismissButton = { TextButton(onClick = { sharedUris = emptyList() }) { Text(Lang.t("cancel")) } },
+                )
             }
         }
     }
@@ -98,6 +193,9 @@ class MainActivity : ComponentActivity() {
             Button(onClick = { onPick("import") }, modifier = Modifier.fillMaxWidth().height(88.dp)) {
                 Text(Lang.t("imp_stickers"), style = MaterialTheme.typography.titleLarge)
             }
+            OutlinedButton(onClick = { onPick("manage") }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
+                Text(Lang.t("manage_stickers"), style = MaterialTheme.typography.titleMedium)
+            }
             Text(Lang.t("both_support"))
             Text(Lang.t("vpn_home"), color = MaterialTheme.colorScheme.error)
             UpdateBanner()
@@ -105,17 +203,19 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun WhatsAppScreen(onBack: () -> Unit) {
+    private fun WhatsAppScreen(initial: List<Uri>, onBack: () -> Unit) {
+        val context = LocalContext.current
         var name by remember { mutableStateOf("") }
-        var animated by remember { mutableStateOf(false) }
-        var picked by remember { mutableStateOf<List<Uri>>(emptyList()) }
+        var animated by remember { mutableStateOf(initial.any { context.looksAnimated(it) }) }
+        var picked by remember { mutableStateOf(initial) }
         var busy by remember { mutableStateOf(false) }
+        val trims = remember { mutableStateMapOf<Uri, Trim>() }
+        val emojis = remember { mutableStateMapOf<Uri, String>() }
+        val captions = remember { mutableStateMapOf<Uri, String>() }
         val scope = rememberCoroutineScope()
 
-        val trims = remember { mutableStateMapOf<Uri, Trim>() }
-        val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) {
-            picked = it
-            trims.clear()
+        val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { list ->
+            picked = (picked + list).distinct().take(30)
         }
 
         Column(
@@ -126,7 +226,13 @@ class MainActivity : ComponentActivity() {
             Text(Lang.t("wa_stickers"), style = MaterialTheme.typography.headlineMedium)
             OutlinedTextField(name, { name = it }, label = { Text(Lang.t("pack_name")) }, modifier = Modifier.fillMaxWidth())
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(animated, { animated = it; picked = emptyList(); trims.clear() })
+                Switch(animated, {
+                    animated = it
+                    picked = emptyList()
+                    trims.clear()
+                    emojis.clear()
+                    captions.clear()
+                })
                 Spacer(Modifier.width(12.dp))
                 Text(if (animated) Lang.t("animated_wa") else Lang.t("static_wa"))
             }
@@ -134,20 +240,43 @@ class MainActivity : ComponentActivity() {
                 Text(Lang.t("choose_wa", picked.size))
             }
 
-            if (animated && picked.isNotEmpty()) {
-                Text(Lang.t("trim_hint"))
-                picked.forEachIndexed { i, uri -> TrimRow(i + 1, uri, 9500L, trims) }
+            if (picked.isNotEmpty()) {
+                StickerEditor(
+                    picked = picked,
+                    onPickedChange = { picked = it },
+                    animated = animated,
+                    maxLengthMs = 9500L,
+                    trims = trims,
+                    emojis = emojis,
+                    captions = captions,
+                )
             }
+
             Button(
                 enabled = !busy && name.isNotBlank() && picked.size in 3..30,
                 onClick = {
                     busy = true
                     status = Lang.t("starting")
                     scope.launch {
-                        val result = withContext(Dispatchers.IO) { runCatching { buildPack(name.trim(), animated, picked, trims = trims.toMap()) } }
+                        val uris = picked
+                        val result = withContext(Dispatchers.IO) {
+                            runCatching {
+                                buildPack(
+                                    name.trim(), animated, uris,
+                                    emojis = uris.map { emojis[it] ?: "" },
+                                    trims = trims.toMap(),
+                                    captions = uris.map { captions[it] ?: "" },
+                                )
+                            }
+                        }
                         busy = false
                         result
-                            .onSuccess { queue.clear(); pending = 0; status = "$summary\n\n" + Lang.t("wa_opening"); addToWhatsApp(it) }
+                            .onSuccess {
+                                queue.clear()
+                                pending = 0
+                                status = "$summary\n\n" + Lang.t("wa_opening")
+                                addToWhatsApp(it)
+                            }
                             .onFailure { status = Lang.t("error_with", it.message ?: it.javaClass.simpleName) }
                     }
                 },
@@ -157,12 +286,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Takes a Telegram sticker pack link, downloads the pack and turns it into a WhatsApp pack. */
+    /** Takes a Telegram sticker pack link, downloads the pack and turns it into WhatsApp pack(s). */
     @Composable
-    private fun ImportScreen(onBack: () -> Unit) {
+    private fun ImportScreen(initialLink: String, onBack: () -> Unit) {
         val prefs = remember { getSharedPreferences("telegram", Context.MODE_PRIVATE) }
         val token = remember { prefs.getString("token", "") ?: "" }
-        var link by remember { mutableStateOf("") }
+        var link by remember { mutableStateOf(initialLink) }
         var busy by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
 
@@ -227,22 +356,25 @@ class MainActivity : ComponentActivity() {
         val set = TelegramImport.fetchSet(token, name)
 
         // A WhatsApp pack is all static or all animated: keep the bigger group.
+        // Animated means video (WebM) or Lottie (TGS) stickers.
         val statics = set.stickers.filter { it.kind == "static" }
-        val videos = set.stickers.filter { it.kind == "video" }
-        val tgsCount = set.stickers.count { it.kind == "animated" }
-        val animated = videos.size > statics.size
-        val chosen = if (animated) videos else statics
-
-        val notes = ArrayList<String>()
-        if (tgsCount > 0) notes.add(Lang.t("imp_tgs", tgsCount))
+        val motion = set.stickers.filter { it.kind == "video" || it.kind == "animated" }
+        val animated = motion.size > statics.size
+        val chosen = if (animated) motion else statics
         if (chosen.size < 3) error(Lang.t("imp_few"))
 
+        val notes = ArrayList<String>()
         val work = File(cacheDir, "tgimport_" + UUID.randomUUID()).apply { mkdirs() }
         try {
             val uris = ArrayList<Uri>()
             chosen.forEachIndexed { i, sticker ->
                 status = Lang.t("imp_downloading", i + 1, chosen.size)
-                val file = File(work, "t$i." + (if (animated) "webm" else "webp"))
+                val extension = when (sticker.kind) {
+                    "video" -> "webm"
+                    "animated" -> "tgs"
+                    else -> "webp"
+                }
+                val file = File(work, "t$i.$extension")
                 TelegramImport.download(token, sticker.fileId, file)
                 uris.add(Uri.fromFile(file))
             }
@@ -263,8 +395,12 @@ class MainActivity : ComponentActivity() {
                         buildPack(
                             title, animated, uris.subList(start, start + group.size), group.map { it.emoji },
                         ) { uri, out ->
-                            if (animated) TelegramImport.convertVideoSticker(this, File(uri.path!!), out)
-                            else StickerConverter.convertStatic(this, uri, out)
+                            val source = File(uri.path!!)
+                            when {
+                                source.name.endsWith(".tgs") -> TelegramImport.convertTgsSticker(source, out)
+                                animated -> TelegramImport.convertVideoSticker(this, source, out)
+                                else -> StickerConverter.convertStatic(this, uri, out)
+                            }
                         },
                     )
                     summaries.add(summary)
@@ -282,9 +418,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Converts every file to a WhatsApp-ready sticker (resizing, compressing, trimming).
+     * Converts every file to a WhatsApp-ready sticker (resizing, compressing, trimming, adding text).
      * Files that cannot be converted are skipped, as long as 3 or more are left.
-     * [emojis] (optional) gives each sticker its own emoji; [converter] replaces the default conversion.
+     * [emojis] gives each sticker its own emoji, [captions] puts text on it, [converter] replaces the default conversion.
      */
     private fun buildPack(
         name: String,
@@ -292,6 +428,7 @@ class MainActivity : ComponentActivity() {
         uris: List<Uri>,
         emojis: List<String> = emptyList(),
         trims: Map<Uri, Trim> = emptyMap(),
+        captions: List<String> = emptyList(),
         converter: ((Uri, File) -> Unit)? = null,
     ): StickerPack {
         val store = StickerStore(this)
@@ -303,15 +440,17 @@ class MainActivity : ComponentActivity() {
             uris.forEachIndexed { i, uri ->
                 status = Lang.t("converting", i + 1, uris.size)
                 val file = File(dir, "sticker_${stickers.size}.webp")
+                val caption = captions.getOrNull(i) ?: ""
                 try {
                     when {
                         converter != null -> converter(uri, file)
-                        animated -> StickerConverter.convertAnimated(this, uri, file, trims[uri]?.startMs ?: 0L, trims[uri]?.lengthMs ?: 0L)
-                        else -> StickerConverter.convertStatic(this, uri, file)
+                        animated -> StickerConverter.convertAnimated(
+                            this, uri, file, trims[uri]?.startMs ?: 0L, trims[uri]?.lengthMs ?: 0L, caption,
+                        )
+                        else -> StickerConverter.convertStatic(this, uri, file, caption)
                     }
                     StickerValidator.check(file, animated)?.let { error(it) }
-                    val emoji = emojis.getOrNull(i)?.takeIf { it.isNotBlank() } ?: "\uD83D\uDE00"
-                    stickers.add(Sticker(file.name, emoji))
+                    stickers.add(Sticker(file.name, Emoji.forWhatsApp(emojis.getOrNull(i) ?: "")))
                 } catch (e: Exception) {
                     file.delete()
                     skipped.add(Lang.t("file_err", i + 1, e.message ?: e.javaClass.simpleName))
