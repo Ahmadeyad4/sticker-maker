@@ -8,6 +8,7 @@ from your images and adds them to WhatsApp.
 - Tray icon (96x96 PNG) generated automatically
 - Adds the pack through WhatsApp's official ContentProvider + Intent contract
 - Animated packs: UI is ready, but you must plug in an encoder (below)
+- Trim bar for videos/GIFs: one range bar with start/end handles over a filmstrip, plus a live looping preview of the selected part before cutting
 
 ## Run
 1. Open the folder in Android Studio (it generates the Gradle wrapper).
@@ -39,3 +40,4 @@ The tray icon for animated packs must be a still image (extract one frame).
       StickerConverter.kt        image conversion + AnimatedEncoder hook
       StickerContentProvider.kt  WhatsApp contract
       StickerStore.kt            pack storage
+      Trim.kt                    trim range bar + live preview
