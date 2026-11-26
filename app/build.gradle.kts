@@ -56,4 +56,6 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     // FFmpeg with libvpx (VP9), used for Telegram animated stickers. Community-maintained ffmpeg-kit fork.
     implementation("dev.ffmpegkit-maintained:ffmpeg:6.0.3")
+    // Lottie renders Telegram animated (TGS) stickers so they can be turned into WhatsApp stickers.
+    implementation("com.airbnb.android:lottie:6.7.1")
 }
